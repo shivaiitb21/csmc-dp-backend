@@ -198,7 +198,7 @@ app.get('/api/subscription-plans', (req, res) => {
 // Return: { order_id, amount, currency, plan_id }
 app.post('/api/create-order', async (req, res) => {
   try {
-    const { amount, currency = 'INR', receipt = `rcpt_${Date.now()}`, planId, userEmail, userPhone } = req.body;
+    const { amount, currency = 'INR', receipt = `rcpt_${Date.now()}`, planId, userEmail, userPhone, userName, userCategory } = req.body;
 
     let targetAmount = parseInt(amount, 10);
 
@@ -232,8 +232,10 @@ app.post('/api/create-order', async (req, res) => {
         planId: planId || 'custom',
         planName: plan ? plan.name : 'Subscription Plan',
         scope: plan ? plan.scope : 'basic',
-        userEmail: userEmail || '',
+        userName: userName || '',
         userPhone: userPhone || '',
+        userEmail: userEmail || '',
+        userCategory: userCategory || '',
         createdAt: new Date().toISOString()
       }
     };
