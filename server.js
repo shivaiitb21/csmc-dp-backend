@@ -13,6 +13,23 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Security Shield: Protect proprietary spatial data (KML, KMZ, TIFF, raw calibration files)
+app.use((req, res, next) => {
+  const url = req.path.toLowerCase();
+  if (
+    url.endsWith('.kml') ||
+    url.endsWith('.kmz') ||
+    url.endsWith('.tif') ||
+    url.endsWith('.tiff') ||
+    url.endsWith('.aux.xml') ||
+    url.includes('google_earth') ||
+    url.includes('sector_calibration')
+  ) {
+    return res.status(403).json({ error: 'Access denied: Proprietary resource' });
+  }
+  next();
+});
+
 // Serve static frontend files
 app.use(express.static(path.join(__dirname)));
 
