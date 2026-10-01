@@ -220,8 +220,8 @@ const SUBSCRIPTION_PLANS = {
     amountPaise: 900,
     proTools: false,
     singleUse: true,
-    badge: 'Special Offer',
-    description: 'One-time 7-day basic map viewing access for verified users'
+    badge: '3-Day Special Offer',
+    description: 'Introductory 3-day launch trial (ends Oct 4, 2026). Regular tariffs apply thereafter.'
   },
   'basic_1d': {
     id: 'basic_1d',
@@ -373,9 +373,17 @@ app.get('/api/razorpay-key', (req, res) => {
 
 // Active Subscription Plans Schema
 app.get('/api/subscription-plans', (req, res) => {
+  const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-04T23:59:59+05:30').getTime();
+  const isLaunchActive = Date.now() <= LAUNCH_OFFER_END_TIMESTAMP;
+  const plansCopy = JSON.parse(JSON.stringify(SUBSCRIPTION_PLANS));
+  if (!isLaunchActive && plansCopy['launch_7d']) {
+    plansCopy['launch_7d'].available = false;
+    plansCopy['launch_7d'].expired = true;
+  }
   res.json({
     success: true,
-    plans: SUBSCRIPTION_PLANS,
+    plans: plansCopy,
+    launchOfferActive: isLaunchActive,
     timestamp: new Date().toISOString()
   });
 });
@@ -389,6 +397,14 @@ app.post('/api/create-order', async (req, res) => {
 
     if (!planId || !SUBSCRIPTION_PLANS[planId]) {
       return res.status(400).json({ error: "Invalid or unsupported plan identifier." });
+    }
+
+    // 3-Day Introductory Launch Trial Expiry Enforcement (October 4, 2026, 23:59:59 IST)
+    const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-04T23:59:59+05:30').getTime();
+    if (planId === 'launch_7d' && Date.now() > LAUNCH_OFFER_END_TIMESTAMP) {
+      return res.status(400).json({
+        error: "The 3-day special trial offer (₹9 for 7 days) ended on October 4, 2026. Standard tariffs now apply."
+      });
     }
 
     if (!key_id || !key_secret) {
