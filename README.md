@@ -20,6 +20,6 @@ Backend service providing Razorpay Order Creation and HMAC-SHA256 Payment Signat
    - **Start Command**: `node server.js`
 5. Under **Environment Variables**, add:
    - `RAZORPAY_KEY_ID`: `<YOUR_RAZORPAY_KEY_ID>`
-   - `RAZORPAY_KEY_SECRET`: `<YOUR_RAZORPAY_KEY_SECRET>`
+   - `RAZORPAY_KEY_SECRET`: `<YOUR_RAZORPAY_KEY_SECRET>` (Never commit your secret to git!)
 6. Click **Deploy Web Service**
 7. Once deployed, copy your Render URL (e.g., `https://csmc-dp-backend.onrender.com`).

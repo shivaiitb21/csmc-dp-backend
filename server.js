@@ -4,42 +4,185 @@ const cors = require('cors');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const path = require('path');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Trust reverse proxy (e.g., Render, Firebase, Cloudflare, NGINX)
+app.set('trust proxy', 1);
 
-// Security Shield: Protect proprietary spatial data (KML, KMZ, TIFF, raw calibration files)
+// -----------------------------------------------------------------------------
+// 1. HARDENED SECURITY HEADERS (Helmet & CSP)
+// -----------------------------------------------------------------------------
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: [
+        "'self'",
+        "'unsafe-inline'",
+        "'unsafe-eval'",
+        "https://cdn.tailwindcss.com",
+        "https://unpkg.com",
+        "https://checkout.razorpay.com",
+        "https://pagead2.googlesyndication.com",
+        "https://www.gstatic.com",
+        "https://*.firebaseio.com"
+      ],
+      styleSrc: [
+        "'self'",
+        "'unsafe-inline'",
+        "https://fonts.googleapis.com",
+        "https://unpkg.com"
+      ],
+      fontSrc: [
+        "'self'",
+        "https://fonts.gstatic.com",
+        "data:"
+      ],
+      imgSrc: [
+        "'self'",
+        "data:",
+        "blob:",
+        "https:",
+        "*.openstreetmap.org",
+        "*.tile.openstreetmap.org"
+      ],
+      connectSrc: [
+        "'self'",
+        "https://*.firebaseio.com",
+        "https://*.googleapis.com",
+        "https://api.razorpay.com",
+        "https://lumberjack.razorpay.com",
+        "https://pagead2.googlesyndication.com"
+      ],
+      frameSrc: [
+        "'self'",
+        "https://api.razorpay.com",
+        "https://googleads.g.doubleclick.net",
+        "https://pagead2.googlesyndication.com"
+      ],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: []
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+// -----------------------------------------------------------------------------
+// 2. STRICT CORS WHITELISTING
+// -----------------------------------------------------------------------------
+const ALLOWED_ORIGINS = [
+  'https://csmc-dp-portal.web.app',
+  'https://csmc-dp-portal.firebaseapp.com',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
+];
+
+if (process.env.ADDITIONAL_ALLOWED_ORIGINS) {
+  process.env.ADDITIONAL_ALLOWED_ORIGINS.split(',').forEach(o => {
+    if (o.trim()) ALLOWED_ORIGINS.push(o.trim());
+  });
+}
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow non-browser requests (mobile, server-to-server webhooks)
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Cross-Origin Request Blocked by Security Policy'));
+    }
+  },
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-razorpay-signature']
+}));
+
+// -----------------------------------------------------------------------------
+// 3. DEFENSE-IN-DEPTH RATE LIMITING
+// -----------------------------------------------------------------------------
+// Global API Limiter: 200 requests per 15 minutes per IP
+const globalApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests from this IP. Please try again after 15 minutes." }
+});
+app.use('/api/', globalApiLimiter);
+
+// Strict Payment Limiter: 20 payment/order attempts per 15 minutes per IP
+const paymentApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many checkout requests. Please wait a few minutes before trying again." }
+});
+app.use('/api/create-order', paymentApiLimiter);
+app.use('/api/verify-payment', paymentApiLimiter);
+
+// Body parsers with payload size caps to prevent memory exhaustion DoS
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+
+// -----------------------------------------------------------------------------
+// 4. ZERO-TRUST STATIC FILE SHIELD
+// Prevent Directory Traversal, Source Code Exposure & Proprietary Data Exfiltration
+// -----------------------------------------------------------------------------
+const FORBIDDEN_EXTENSIONS = [
+  '.csv', '.env', '.rules', '.tif', '.tiff', '.aux.xml', '.kml', '.kmz',
+  '.md', '.bak', '.log', '.sh', '.yaml', '.yml'
+];
+
+const FORBIDDEN_PATHS = [
+  'rzp-key', 'server.js', 'package.json', 'package-lock.json',
+  'backend', 'functions', 'google_earth', 'sector_calibration',
+  '.backups', '.git', '.firebase', 'node_modules'
+];
+
 app.use((req, res, next) => {
-  const url = req.path.toLowerCase();
-  if (
-    url.endsWith('.kml') ||
-    url.endsWith('.kmz') ||
-    url.endsWith('.tif') ||
-    url.endsWith('.tiff') ||
-    url.endsWith('.aux.xml') ||
-    url.includes('google_earth') ||
-    url.includes('sector_calibration')
-  ) {
-    return res.status(403).json({ error: 'Access denied: Proprietary resource' });
+  const cleanPath = decodeURIComponent(req.path).toLowerCase();
+
+  // 1. Extension inspection
+  const hasForbiddenExt = FORBIDDEN_EXTENSIONS.some(ext => cleanPath.endsWith(ext));
+
+  // 2. Directory & sensitive filename inspection
+  const hasForbiddenPath = FORBIDDEN_PATHS.some(seg => {
+    return cleanPath === `/${seg}` ||
+      cleanPath.startsWith(`/${seg}/`) ||
+      cleanPath.includes(`/${seg}`);
+  });
+
+  // 3. Block access to non-public server files
+  if (hasForbiddenExt || hasForbiddenPath) {
+    return res.status(403).json({
+      error: "Access Forbidden: Requested resource is protected by security policy"
+    });
   }
+
   next();
 });
 
-// Serve static frontend files
-app.use(express.static(path.join(__dirname)));
+// Serve frontend assets with safe static config
+app.use(express.static(path.join(__dirname, '..'), {
+  dotfiles: 'ignore',
+  index: false,
+  maxAge: '1h'
+}));
 
-// Razorpay Instance
+// -----------------------------------------------------------------------------
+// 5. RAZORPAY INSTANCE & PRICING MATRIX
+// -----------------------------------------------------------------------------
 const key_id = process.env.RAZORPAY_KEY_ID;
 const key_secret = process.env.RAZORPAY_KEY_SECRET;
 const webhook_secret = process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET;
 
 if (!key_id || !key_secret) {
-  console.warn("WARNING: RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET not set in environment variables!");
+  console.warn("SECURITY WARNING: RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET missing in environment variables!");
 }
 
 const razorpay = new Razorpay({
@@ -47,9 +190,17 @@ const razorpay = new Razorpay({
   key_secret: key_secret || ''
 });
 
-// Official Subscription Pricing Matrix
+// In-Memory Idempotency Cache for Replay Attack Prevention (Stores payment_id -> timestamp)
+const PROCESSED_PAYMENTS = new Map();
+// Evict entries older than 24 hours every hour
+setInterval(() => {
+  const cutoff = Date.now() - (24 * 60 * 60 * 1000);
+  for (const [id, time] of PROCESSED_PAYMENTS.entries()) {
+    if (time < cutoff) PROCESSED_PAYMENTS.delete(id);
+  }
+}, 60 * 60 * 1000);
+
 const SUBSCRIPTION_PLANS = {
-  // Launch Offer (One-Time Trial)
   'launch_7d': {
     id: 'launch_7d',
     name: 'Launch Special Trial',
@@ -65,14 +216,13 @@ const SUBSCRIPTION_PLANS = {
     badge: 'Special Offer',
     description: 'One-time 7-day basic map viewing access for verified users'
   },
-  // Basic View Tiers
   'basic_1d': {
     id: 'basic_1d',
     name: '1-Day Basic Pass',
     tier: 'basic',
     scope: 'basic',
     durationDays: 1,
-    durationHours: 24, // Strictly 24 hours
+    durationHours: 24,
     durationLabel: '24 Hours',
     price: 49,
     amountPaise: 4900,
@@ -127,14 +277,13 @@ const SUBSCRIPTION_PLANS = {
     savings: 'Save ₹589',
     description: 'Annual basic viewing access for architects & planners'
   },
-  // Pro Tools Tiers
   'pro_1d': {
     id: 'pro_1d',
     name: '1-Day Pro Pass',
     tier: 'pro',
     scope: 'pro',
     durationDays: 1,
-    durationHours: 24, // Strictly 24 hours
+    durationHours: 24,
     durationLabel: '24 Hours',
     price: 99,
     amountPaise: 9900,
@@ -192,15 +341,30 @@ const SUBSCRIPTION_PLANS = {
   }
 };
 
-// Endpoint to fetch public key for frontend (Never exposes secret)
+/**
+ * Constant-time string comparison to protect against side-channel timing attacks
+ */
+function secureCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// -----------------------------------------------------------------------------
+// 6. API ENDPOINTS
+// -----------------------------------------------------------------------------
+
+// Public Key Configuration Endpoint
 app.get('/api/razorpay-key', (req, res) => {
-  if (!process.env.RAZORPAY_KEY_ID) {
+  if (!key_id) {
     return res.status(500).json({ error: "Razorpay Key ID not configured on server" });
   }
-  res.json({ key_id: process.env.RAZORPAY_KEY_ID });
+  res.json({ key_id: key_id });
 });
 
-// Endpoint to fetch active subscription plans schema
+// Active Subscription Plans Schema
 app.get('/api/subscription-plans', (req, res) => {
   res.json({
     success: true,
@@ -209,192 +373,207 @@ app.get('/api/subscription-plans', (req, res) => {
   });
 });
 
-// STEP 1: BACKEND - Create Order
+// STEP 1: Create Order
 // POST /api/create-order
-// Request: { amount (in paise), currency, receipt, planId, userEmail, userPhone }
-// Return: { order_id, amount, currency, plan_id }
+// Server enforces plan pricing; prevents client-side price tampering
 app.post('/api/create-order', async (req, res) => {
   try {
-    const { amount, currency = 'INR', receipt = `rcpt_${Date.now()}`, planId, userEmail, userPhone, userName, userCategory } = req.body;
+    const { planId, userEmail, userPhone, userName, userCategory } = req.body;
 
-    let targetAmount = parseInt(amount, 10);
-
-    // If planId provided, strictly validate amount against verified pricing matrix
-    if (planId && SUBSCRIPTION_PLANS[planId]) {
-      targetAmount = SUBSCRIPTION_PLANS[planId].amountPaise;
-    }
-
-    // Validate amount >= 100 paise (₹1.00)
-    if (!targetAmount || isNaN(targetAmount) || targetAmount < 100) {
-      return res.status(400).json({
-        error: "Invalid amount. Minimum amount must be at least 100 paise (₹1.00)."
-      });
+    if (!planId || !SUBSCRIPTION_PLANS[planId]) {
+      return res.status(400).json({ error: "Invalid or unsupported plan identifier." });
     }
 
     if (!key_id || !key_secret) {
-      return res.status(401).json({
-        error: "Razorpay credentials missing on server."
-      });
+      return res.status(500).json({ error: "Payment processor credentials not configured on server." });
     }
 
-    const plan = planId ? SUBSCRIPTION_PLANS[planId] : null;
+    const plan = SUBSCRIPTION_PLANS[planId];
+    // Enforce canonical amount strictly from the server-side pricing matrix
+    const targetAmount = plan.amountPaise;
+
+    // Sanitize metadata fields
+    const sanitizedEmail = String(userEmail || '').trim().toLowerCase().slice(0, 120);
+    const sanitizedPhone = String(userPhone || '').replace(/\D/g, '').slice(-10);
+    const sanitizedName = String(userName || 'Citizen User').slice(0, 80);
+    const sanitizedCat = String(userCategory || 'Individual Citizen').slice(0, 80);
 
     const options = {
       amount: targetAmount,
-      currency: currency || 'INR',
-      receipt: receipt || `rcpt_${Date.now()}`,
+      currency: 'INR',
+      receipt: `rcpt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       payment_capture: 1,
       notes: {
         portal: 'CSMC DP Spatial Portal',
-        planId: planId || 'custom',
-        planName: plan ? plan.name : 'Subscription Plan',
-        scope: plan ? plan.scope : 'basic',
-        userName: userName || '',
-        userPhone: userPhone || '',
-        userEmail: userEmail || '',
-        userCategory: userCategory || '',
+        planId: plan.id,
+        planName: plan.name,
+        scope: plan.scope,
+        amountPaise: String(targetAmount),
+        userName: sanitizedName,
+        userPhone: sanitizedPhone,
+        userEmail: sanitizedEmail,
+        userCategory: sanitizedCat,
         createdAt: new Date().toISOString()
       }
     };
 
     const order = await razorpay.orders.create(options);
     if (!order || !order.id) {
-      return res.status(500).json({ error: "Failed to create order with Razorpay" });
+      return res.status(500).json({ error: "Failed to create order with payment provider." });
     }
 
     res.status(200).json({
       order_id: order.id,
       amount: order.amount,
       currency: order.currency,
-      plan_id: planId || null
+      plan_id: plan.id
     });
   } catch (error) {
-    console.error("Error creating Razorpay order:", error);
-    if (error.statusCode === 401 || error.code === 'BAD_REQUEST_ERROR') {
-      return res.status(error.statusCode || 401).json({
-        error: error.description || error.message || "Razorpay authentication failed"
-      });
-    }
-    res.status(500).json({
-      error: error.description || error.message || "Failed to create Razorpay order"
-    });
+    console.error("Order creation error:", error.message || error);
+    res.status(500).json({ error: "Failed to initialize order." });
   }
 });
 
-// STEP 3: BACKEND - Verify Signature
+// STEP 2: Verify Payment Signature
 // POST /api/verify-payment
-// Algorithm: HMAC-SHA256(order_id + "|" + payment_id, KEY_SECRET)
-app.post('/api/verify-payment', (req, res) => {
+// Cryptographically validates HMAC-SHA256 signature, validates plan against Razorpay order notes (preventing privilege escalation), and enforces idempotency
+app.post('/api/verify-payment', async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, userEmail } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
 
-    // Missing fields validation
+    // Strict parameter validation
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({
         success: false,
-        error: "Missing required payment parameters (razorpay_order_id, razorpay_payment_id, razorpay_signature required)"
+        error: "Missing required payment parameters."
       });
     }
 
     if (!key_secret) {
       return res.status(500).json({
         success: false,
-        error: "Server configuration error: Key Secret not configured"
+        error: "Payment processor key secret not configured on server."
       });
     }
 
-    // Algorithm: HMAC-SHA256(order_id + "|" + payment_id, KEY_SECRET)
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const orderId = String(razorpay_order_id).trim();
+    const paymentId = String(razorpay_payment_id).trim();
+    const signature = String(razorpay_signature).trim();
+
+    // 1. Anti-Replay Check (Idempotency)
+    if (PROCESSED_PAYMENTS.has(paymentId)) {
+      return res.status(409).json({
+        success: false,
+        error: "Payment already processed. Duplicate redemption rejected."
+      });
+    }
+
+    // 2. Cryptographic HMAC-SHA256 Signature Verification (Constant-Time)
     const expectedSignature = crypto
       .createHmac('sha256', key_secret)
-      .update(body.toString())
+      .update(`${orderId}|${paymentId}`)
       .digest('hex');
 
-    // Compare signatures securely
-    const isAuthentic = (expectedSignature === razorpay_signature);
-
-    if (isAuthentic) {
-      const plan = (planId && SUBSCRIPTION_PLANS[planId]) ? SUBSCRIPTION_PLANS[planId] : null;
-      const now = Date.now();
-      let expiryTimestamp = now + (30 * 24 * 60 * 60 * 1000); // default 30 days
-
-      if (plan) {
-        if (plan.durationHours === 24) {
-          // Strictly 24 hours from purchase timestamp
-          expiryTimestamp = now + (24 * 60 * 60 * 1000);
-        } else {
-          expiryTimestamp = now + (plan.durationDays * 24 * 60 * 60 * 1000);
-        }
-      }
-
-      return res.status(200).json({
-        success: true,
-        message: "Payment signature verified successfully",
-        order_id: razorpay_order_id,
-        payment_id: razorpay_payment_id,
-        planId: planId || null,
-        planName: plan ? plan.name : 'Subscription',
-        scope: plan ? plan.scope : 'basic',
-        proToolsEnabled: plan ? plan.proTools : false,
-        purchaseTimestamp: now,
-        expiryTimestamp: expiryTimestamp,
-        expiryDate: new Date(expiryTimestamp).toISOString()
-      });
-    } else {
-      // Signature mismatch: return 400, do NOT mark as paid
+    if (!secureCompare(expectedSignature, signature)) {
+      console.warn(`[AUDIT] Security Alert: Invalid payment signature for order: ${orderId}`);
       return res.status(400).json({
         success: false,
-        error: "Payment verification failed: Signature mismatch"
+        error: "Payment verification failed: Cryptographic signature mismatch."
       });
     }
+
+    // 3. Server-Side Privilege Escalation Defense:
+    // Fetch the canonical order directly from Razorpay to verify the actual purchased plan & amount
+    let verifiedPlanId = 'basic_1m';
+    try {
+      const orderData = await razorpay.orders.fetch(orderId);
+      if (orderData && orderData.notes && orderData.notes.planId) {
+        verifiedPlanId = orderData.notes.planId;
+      }
+    } catch (fetchErr) {
+      console.warn("Could not fetch order from Razorpay API, falling back to body notes:", fetchErr.message);
+      if (req.body.planId && SUBSCRIPTION_PLANS[req.body.planId]) {
+        verifiedPlanId = req.body.planId;
+      }
+    }
+
+    const plan = SUBSCRIPTION_PLANS[verifiedPlanId] || SUBSCRIPTION_PLANS['basic_1m'];
+    const now = Date.now();
+    let expiryTimestamp;
+
+    if (plan.durationHours === 24) {
+      expiryTimestamp = now + (24 * 60 * 60 * 1000);
+    } else {
+      expiryTimestamp = now + (plan.durationDays * 24 * 60 * 60 * 1000);
+    }
+
+    // Mark payment as consumed in idempotency ledger
+    PROCESSED_PAYMENTS.set(paymentId, now);
+
+    res.status(200).json({
+      success: true,
+      message: "Payment signature verified successfully",
+      order_id: orderId,
+      payment_id: paymentId,
+      planId: plan.id,
+      planName: plan.name,
+      scope: plan.scope,
+      proToolsEnabled: plan.proTools,
+      purchaseTimestamp: now,
+      expiryTimestamp: expiryTimestamp,
+      expiryDate: new Date(expiryTimestamp).toISOString()
+    });
   } catch (error) {
-    console.error("Error verifying Razorpay signature:", error);
+    console.error("Payment verification internal error:", error.message || error);
     res.status(500).json({
       success: false,
-      error: "Internal server error during payment verification"
+      error: "Internal server error during payment verification."
     });
   }
 });
 
-// STEP 4: BACKEND - Razorpay Webhook Handler
+// STEP 3: Razorpay Webhook Handler
 // POST /api/razorpay-webhook
-// Validates signature and handles server-to-server payment updates
 app.post('/api/razorpay-webhook', (req, res) => {
   try {
     const signature = req.headers['x-razorpay-signature'];
     if (!signature) {
-      return res.status(400).json({ error: "Missing x-razorpay-signature header" });
+      return res.status(400).json({ error: "Missing x-razorpay-signature header." });
+    }
+
+    const secret = webhook_secret || key_secret;
+    if (!secret) {
+      return res.status(500).json({ error: "Webhook secret not configured on server." });
     }
 
     const payload = JSON.stringify(req.body);
     const expectedSignature = crypto
-      .createHmac('sha256', webhook_secret || key_secret)
+      .createHmac('sha256', secret)
       .update(payload)
       .digest('hex');
 
-    if (expectedSignature !== signature) {
-      console.warn("⚠️ Webhook signature mismatch from IP:", req.ip);
-      return res.status(400).json({ error: "Invalid webhook signature" });
+    if (!secureCompare(expectedSignature, signature)) {
+      console.warn("Security Alert: Webhook signature verification mismatch from IP:", req.ip);
+      return res.status(400).json({ error: "Invalid webhook signature." });
     }
 
     const event = req.body.event;
-    console.log(`🔔 Razorpay Webhook received event: ${event}`);
-
-    // Process event types
     if (event === 'order.paid' || event === 'payment.captured') {
       const paymentEntity = req.body.payload?.payment?.entity;
       const notes = paymentEntity?.notes || {};
-      console.log(`✅ Webhook verified payment ID: ${paymentEntity?.id}, Amount: ₹${(paymentEntity?.amount || 0) / 100}, Plan: ${notes.planId}`);
+      const pid = paymentEntity?.id;
+      if (pid) PROCESSED_PAYMENTS.set(pid, Date.now());
+      console.log(`[AUDIT] Webhook confirmed payment ${pid}, Plan: ${notes.planId}`);
     }
 
     res.status(200).json({ status: "ok", received: true });
   } catch (err) {
-    console.error("Webhook processing error:", err);
-    res.status(500).json({ error: "Webhook processing failed" });
+    console.error("Webhook processing error:", err.message || err);
+    res.status(500).json({ error: "Webhook processing failed." });
   }
 });
 
-// Health check route
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: "healthy",
@@ -404,13 +583,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Root route: Serve frontend if present, otherwise return API status
+// Root endpoint
 app.get('/', (req, res) => {
-  const indexPath = path.join(__dirname, 'index.html');
-  const fs = require('fs');
-  if (fs.existsSync(indexPath)) {
-    return res.sendFile(indexPath);
-  }
   res.json({
     status: "online",
     service: "CSMC DP Spatial Portal Payment API",
@@ -425,10 +599,15 @@ app.get('/', (req, res) => {
   });
 });
 
+// Global 404 handler for unmatched API routes
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: "API endpoint not found." });
+});
+
 // Start Server if run directly
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`CSMC Spatial Portal Server running on http://localhost:${PORT}`);
+    console.log(`CSMC Spatial Portal Backend running securely on http://localhost:${PORT}`);
     console.log(`Razorpay Key ID configured: ${key_id ? key_id.substring(0, 8) + '...' : 'NONE'}`);
   });
 }
