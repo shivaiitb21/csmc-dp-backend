@@ -192,11 +192,18 @@ const razorpay = new Razorpay({
 
 // In-Memory Idempotency Cache for Replay Attack Prevention (Stores payment_id -> timestamp)
 const PROCESSED_PAYMENTS = new Map();
-// Evict entries older than 24 hours every hour
+// In-Memory Cache of Verified Subscriptions for Instant Restoration & Redundancy
+const VERIFIED_SUBSCRIPTIONS = new Map();
+
+// Evict entries older than 30 days every 2 hours
 setInterval(() => {
   const cutoff = Date.now() - (24 * 60 * 60 * 1000);
   for (const [id, time] of PROCESSED_PAYMENTS.entries()) {
     if (time < cutoff) PROCESSED_PAYMENTS.delete(id);
+  }
+  const subCutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
+  for (const [id, sub] of VERIFIED_SUBSCRIPTIONS.entries()) {
+    if ((sub.expiryTimestamp || 0) < subCutoff) VERIFIED_SUBSCRIPTIONS.delete(id);
   }
 }, 60 * 60 * 1000);
 
@@ -510,6 +517,28 @@ app.post('/api/verify-payment', async (req, res) => {
     // Mark payment as consumed in idempotency ledger
     PROCESSED_PAYMENTS.set(paymentId, now);
 
+    // Cache verified subscription record in memory
+    const userEmail = String(req.body.userEmail || '').trim().toLowerCase();
+    const userPhone = String(req.body.userPhone || '').replace(/\D/g, '').slice(-10);
+    const userName = String(req.body.userName || '').trim().slice(0, 80) || (userEmail ? userEmail.split('@')[0] : 'Pass Holder');
+
+    VERIFIED_SUBSCRIPTIONS.set(paymentId, {
+      isSubscribed: true,
+      planId: plan.id,
+      planName: plan.name,
+      scope: plan.scope,
+      proToolsEnabled: Boolean(plan.proTools),
+      price: plan.price,
+      purchaseTimestamp: now,
+      expiryTimestamp: expiryTimestamp,
+      expiryDate: new Date(expiryTimestamp).toISOString(),
+      paymentId: paymentId,
+      orderId: orderId,
+      email: userEmail,
+      phone: userPhone,
+      name: userName
+    });
+
     res.status(200).json({
       success: true,
       message: "Payment signature verified successfully",
@@ -573,6 +602,228 @@ app.post('/api/razorpay-webhook', (req, res) => {
   }
 });
 
+// STEP 4: Subscription Lookup & Pass Restoration Endpoint
+// Supports Email, 10-digit Phone, or Razorpay Payment ID (pay_...)
+
+function inferPlanFromPayment(p) {
+  const planIdFromNotes = p.notes && p.notes.planId;
+  if (planIdFromNotes && SUBSCRIPTION_PLANS[planIdFromNotes]) {
+    return SUBSCRIPTION_PLANS[planIdFromNotes];
+  }
+  const amt = p.amount ? p.amount / 100 : 0;
+  if (amt === 9) return SUBSCRIPTION_PLANS['launch_7d'];
+  if (amt === 49) return SUBSCRIPTION_PLANS['basic_1d'];
+  if (amt === 99) {
+    if (p.notes?.scope === 'pro' || (p.description && p.description.toLowerCase().includes('pro'))) {
+      return SUBSCRIPTION_PLANS['pro_1d'];
+    }
+    return SUBSCRIPTION_PLANS['basic_1w'];
+  }
+  if (amt === 199 || amt === 249) return SUBSCRIPTION_PLANS['pro_1w'];
+  if (amt === 299) return SUBSCRIPTION_PLANS['basic_1m'];
+  if (amt === 599) return SUBSCRIPTION_PLANS['pro_1m'];
+  if (amt === 2999) return SUBSCRIPTION_PLANS['basic_1y'];
+  if (amt === 5999) return SUBSCRIPTION_PLANS['pro_1y'];
+  return SUBSCRIPTION_PLANS['basic_1m'];
+}
+
+function calculateExpiry(p, plan) {
+  const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
+  if (plan.durationHours === 24) {
+    return purchaseMs + (24 * 60 * 60 * 1000);
+  }
+  return purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
+}
+
+async function handleSubscriptionLookup(req, res) {
+  try {
+    const params = req.method === 'GET' ? req.query : req.body;
+    let rawEmail = String(params.email || '').trim().toLowerCase().slice(0, 120);
+    let rawPhone = String(params.phone || '').replace(/\D/g, '').slice(-10);
+    let rawPayId = String(params.paymentId || params.payId || '').trim().slice(0, 80);
+
+    // If paymentId was passed in email field by mistake (e.g. pay_...)
+    if (rawEmail.startsWith('pay_')) {
+      rawPayId = rawEmail;
+      rawEmail = '';
+    } else if (rawEmail.replace(/\D/g, '').length === 10 && !rawEmail.includes('@')) {
+      rawPhone = rawEmail.replace(/\D/g, '').slice(-10);
+      rawEmail = '';
+    }
+
+    if (!rawEmail && !rawPhone && !rawPayId) {
+      return res.status(400).json({
+        success: false,
+        found: false,
+        error: "Please provide an email address, registered phone number, or payment ID."
+      });
+    }
+
+    if (!key_id || !key_secret) {
+      return res.status(500).json({
+        success: false,
+        error: "Payment processor credentials not configured on server."
+      });
+    }
+
+    const candidates = [];
+    const now = Date.now();
+
+    // 1. Check in-memory verified subscriptions cache
+    for (const sub of VERIFIED_SUBSCRIPTIONS.values()) {
+      const emailMatch = rawEmail && rawEmail.includes('@') && sub.email && (sub.email === rawEmail || sub.email.includes(rawEmail));
+      const phoneMatch = rawPhone && rawPhone.length === 10 && sub.phone && sub.phone.endsWith(rawPhone);
+      const payMatch = rawPayId && sub.paymentId === rawPayId;
+      if (emailMatch || phoneMatch || payMatch) {
+        const plan = SUBSCRIPTION_PLANS[sub.planId] || { id: sub.planId, name: sub.planName, scope: sub.scope, proTools: sub.proToolsEnabled, price: sub.price };
+        candidates.push({
+          plan,
+          expiryTimestamp: sub.expiryTimestamp,
+          isExpired: now >= sub.expiryTimestamp,
+          purchaseTimestamp: sub.purchaseTimestamp,
+          paymentId: sub.paymentId,
+          orderId: sub.orderId,
+          email: sub.email,
+          phone: sub.phone,
+          name: sub.name
+        });
+      }
+    }
+
+    // 2. Direct fetch from Razorpay if paymentId provided
+    if (rawPayId && rawPayId.startsWith('pay_')) {
+      try {
+        const p = await razorpay.payments.fetch(rawPayId);
+        if (p && (p.status === 'captured' || p.status === 'authorized')) {
+          const plan = inferPlanFromPayment(p);
+          const expiry = calculateExpiry(p, plan);
+          candidates.push({
+            plan,
+            expiryTimestamp: expiry,
+            isExpired: now >= expiry,
+            purchaseTimestamp: p.created_at * 1000,
+            paymentId: p.id,
+            orderId: p.order_id,
+            email: p.email || p.notes?.userEmail,
+            phone: p.contact || p.notes?.userPhone,
+            name: p.notes?.userName || (p.email ? p.email.split('@')[0] : 'Pass Holder')
+          });
+        }
+      } catch (fetchErr) {
+        console.warn("Direct payment fetch notice:", fetchErr.message);
+      }
+    }
+
+    // 3. Scan recent Razorpay payments (last 100)
+    try {
+      const paymentList = await razorpay.payments.all({ count: 100 });
+      if (paymentList && Array.isArray(paymentList.items)) {
+        for (const p of paymentList.items) {
+          if (p.status !== 'captured' && p.status !== 'authorized') continue;
+
+          const pEmail = String(p.email || '').trim().toLowerCase();
+          const pNotesEmail = String(p.notes?.userEmail || p.notes?.email || '').trim().toLowerCase();
+          const pPhone = String(p.contact || '').replace(/\D/g, '').slice(-10);
+          const pNotesPhone = String(p.notes?.userPhone || p.notes?.phone || '').replace(/\D/g, '').slice(-10);
+          const pId = String(p.id || '').trim();
+
+          const emailMatch = rawEmail && rawEmail.includes('@') && (
+            pEmail === rawEmail ||
+            pNotesEmail === rawEmail ||
+            (rawEmail.length >= 5 && pEmail.includes(rawEmail)) ||
+            (rawEmail.length >= 5 && pNotesEmail.includes(rawEmail))
+          );
+          const phoneMatch = rawPhone && rawPhone.length === 10 && (
+            pPhone === rawPhone ||
+            pNotesPhone === rawPhone
+          );
+          const payMatch = rawPayId && pId === rawPayId;
+
+          if (emailMatch || phoneMatch || payMatch) {
+            if (!candidates.some(c => c.paymentId === p.id)) {
+              const plan = inferPlanFromPayment(p);
+              const expiry = calculateExpiry(p, plan);
+              candidates.push({
+                plan,
+                expiryTimestamp: expiry,
+                isExpired: now >= expiry,
+                purchaseTimestamp: p.created_at * 1000,
+                paymentId: p.id,
+                orderId: p.order_id,
+                email: p.email || p.notes?.userEmail || rawEmail,
+                phone: p.contact || p.notes?.userPhone || rawPhone,
+                name: p.notes?.userName || (p.email ? p.email.split('@')[0] : 'Pass Holder')
+              });
+            }
+          }
+        }
+      }
+    } catch (rzpErr) {
+      console.warn("Razorpay payments scan notice:", rzpErr.message);
+    }
+
+    if (candidates.length === 0) {
+      return res.status(200).json({
+        success: false,
+        found: false,
+        message: "No subscription record found matching the provided details."
+      });
+    }
+
+    // Sort: latest expiry first
+    candidates.sort((a, b) => b.expiryTimestamp - a.expiryTimestamp);
+
+    // Pick active candidate if exists, else latest
+    const activeCandidate = candidates.find(c => !c.isExpired);
+    if (activeCandidate) {
+      return res.status(200).json({
+        success: true,
+        found: true,
+        active: true,
+        subscription: {
+          isSubscribed: true,
+          planId: activeCandidate.plan.id,
+          planName: activeCandidate.plan.name,
+          scope: activeCandidate.plan.scope,
+          proToolsEnabled: Boolean(activeCandidate.plan.proTools),
+          price: activeCandidate.plan.price,
+          purchaseTimestamp: activeCandidate.purchaseTimestamp,
+          purchaseDate: new Date(activeCandidate.purchaseTimestamp).toISOString(),
+          expiryTimestamp: activeCandidate.expiryTimestamp,
+          expiryDate: new Date(activeCandidate.expiryTimestamp).toISOString(),
+          paymentId: activeCandidate.paymentId,
+          orderId: activeCandidate.orderId,
+          email: activeCandidate.email,
+          phone: activeCandidate.phone,
+          name: activeCandidate.name
+        }
+      });
+    } else {
+      const latest = candidates[0];
+      const expFormatted = new Date(latest.expiryTimestamp).toLocaleDateString('en-IN');
+      return res.status(200).json({
+        success: false,
+        found: true,
+        expired: true,
+        planName: latest.plan.name,
+        expiryTimestamp: latest.expiryTimestamp,
+        expiryDate: new Date(latest.expiryTimestamp).toISOString(),
+        expiryFormatted: expFormatted,
+        message: `Subscription record found for ${latest.name || latest.email}, but it expired on ${expFormatted}. Please purchase a new pass.`
+      });
+    }
+  } catch (err) {
+    console.error("Lookup subscription internal error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Internal error checking subscription."
+    });
+  }
+}
+
+app.post('/api/lookup-subscription', handleSubscriptionLookup);
+app.get('/api/lookup-subscription', handleSubscriptionLookup);
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -591,6 +842,8 @@ app.get('/', (req, res) => {
     endpoints: [
       "POST /api/create-order",
       "POST /api/verify-payment",
+      "POST /api/lookup-subscription",
+      "GET /api/lookup-subscription",
       "POST /api/razorpay-webhook",
       "GET /api/subscription-plans",
       "GET /api/razorpay-key",
