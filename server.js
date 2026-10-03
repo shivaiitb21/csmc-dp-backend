@@ -1400,6 +1400,57 @@ app.post('/api/admin-reconcile', async (req, res) => {
     const errMsg = err.error?.description || err.message || String(err);
     console.error('[Admin Reconcile] Fatal error:', errMsg);
     return res.status(500).json({ success: false, error: errMsg });
+});
+
+// =============================================================================
+// ADMIN: PUBLISH DYNAMIC PRICING ENDPOINT
+// POST /api/admin-pricing
+// Updates in-memory plans and syncs to settings/pricing in Firestore via Admin SDK.
+// =============================================================================
+app.post('/api/admin-pricing', async (req, res) => {
+  const ADMIN_RECONCILE_KEY = process.env.ADMIN_RECONCILE_KEY || 'csmc_admin_reconcile_2024';
+  const { adminKey, pricing } = req.body;
+  if (adminKey !== ADMIN_RECONCILE_KEY) {
+    return res.status(403).json({ error: 'Unauthorized: invalid admin key.' });
+  }
+  if (!pricing) {
+    return res.status(400).json({ error: 'Pricing payload required.' });
+  }
+
+  try {
+    // Update in-memory plans if tiers are provided
+    if (pricing.tiers) {
+      const basicPrices = pricing.tiers.basic?.prices || {};
+      const proPrices = pricing.tiers.pro?.prices || {};
+
+      if (SUBSCRIPTION_PLANS['basic_1d'] && basicPrices['1_day']) SUBSCRIPTION_PLANS['basic_1d'].price = basicPrices['1_day'];
+      if (SUBSCRIPTION_PLANS['basic_7d'] && basicPrices['7_days']) SUBSCRIPTION_PLANS['basic_7d'].price = basicPrices['7_days'];
+      if (SUBSCRIPTION_PLANS['basic_1m'] && basicPrices['30_days']) SUBSCRIPTION_PLANS['basic_1m'].price = basicPrices['30_days'];
+      if (SUBSCRIPTION_PLANS['basic_1y'] && basicPrices['365_days']) SUBSCRIPTION_PLANS['basic_1y'].price = basicPrices['365_days'];
+
+      if (SUBSCRIPTION_PLANS['pro_1d'] && proPrices['1_day']) SUBSCRIPTION_PLANS['pro_1d'].price = proPrices['1_day'];
+      if (SUBSCRIPTION_PLANS['pro_7d'] && proPrices['7_days']) SUBSCRIPTION_PLANS['pro_7d'].price = proPrices['7_days'];
+      if (SUBSCRIPTION_PLANS['pro_1m'] && proPrices['30_days']) SUBSCRIPTION_PLANS['pro_1m'].price = proPrices['30_days'];
+      if (SUBSCRIPTION_PLANS['pro_1y'] && proPrices['365_days']) SUBSCRIPTION_PLANS['pro_1y'].price = proPrices['365_days'];
+    }
+    if (pricing.trialOffer && pricing.trialOffer.price && SUBSCRIPTION_PLANS['launch_7d']) {
+      SUBSCRIPTION_PLANS['launch_7d'].price = pricing.trialOffer.price;
+    }
+
+    // Save to Firestore via Admin SDK if available
+    let firestoreSaved = false;
+    if (adminDb) {
+      try {
+        await adminDb.collection('settings').doc('pricing').set(pricing, { merge: true });
+        firestoreSaved = true;
+      } catch (fsErr) {
+        console.warn('[Admin Pricing] Firestore write failed:', fsErr.message);
+      }
+    }
+
+    return res.json({ success: true, firestoreSaved, plansCount: Object.keys(SUBSCRIPTION_PLANS).length });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
