@@ -1423,18 +1423,43 @@ app.post('/api/admin-pricing', async (req, res) => {
       const basicPrices = pricing.tiers.basic?.prices || {};
       const proPrices = pricing.tiers.pro?.prices || {};
 
-      if (SUBSCRIPTION_PLANS['basic_1d'] && basicPrices['1_day']) SUBSCRIPTION_PLANS['basic_1d'].price = basicPrices['1_day'];
-      if (SUBSCRIPTION_PLANS['basic_7d'] && basicPrices['7_days']) SUBSCRIPTION_PLANS['basic_7d'].price = basicPrices['7_days'];
-      if (SUBSCRIPTION_PLANS['basic_1m'] && basicPrices['30_days']) SUBSCRIPTION_PLANS['basic_1m'].price = basicPrices['30_days'];
-      if (SUBSCRIPTION_PLANS['basic_1y'] && basicPrices['365_days']) SUBSCRIPTION_PLANS['basic_1y'].price = basicPrices['365_days'];
+      if (SUBSCRIPTION_PLANS['basic_1d'] && basicPrices['1_day']) {
+        SUBSCRIPTION_PLANS['basic_1d'].price = basicPrices['1_day'];
+        SUBSCRIPTION_PLANS['basic_1d'].amountPaise = basicPrices['1_day'] * 100;
+      }
+      if (SUBSCRIPTION_PLANS['basic_7d'] && basicPrices['7_days']) {
+        SUBSCRIPTION_PLANS['basic_7d'].price = basicPrices['7_days'];
+        SUBSCRIPTION_PLANS['basic_7d'].amountPaise = basicPrices['7_days'] * 100;
+      }
+      if (SUBSCRIPTION_PLANS['basic_1m'] && basicPrices['30_days']) {
+        SUBSCRIPTION_PLANS['basic_1m'].price = basicPrices['30_days'];
+        SUBSCRIPTION_PLANS['basic_1m'].amountPaise = basicPrices['30_days'] * 100;
+      }
+      if (SUBSCRIPTION_PLANS['basic_1y'] && basicPrices['365_days']) {
+        SUBSCRIPTION_PLANS['basic_1y'].price = basicPrices['365_days'];
+        SUBSCRIPTION_PLANS['basic_1y'].amountPaise = basicPrices['365_days'] * 100;
+      }
 
-      if (SUBSCRIPTION_PLANS['pro_1d'] && proPrices['1_day']) SUBSCRIPTION_PLANS['pro_1d'].price = proPrices['1_day'];
-      if (SUBSCRIPTION_PLANS['pro_7d'] && proPrices['7_days']) SUBSCRIPTION_PLANS['pro_7d'].price = proPrices['7_days'];
-      if (SUBSCRIPTION_PLANS['pro_1m'] && proPrices['30_days']) SUBSCRIPTION_PLANS['pro_1m'].price = proPrices['30_days'];
-      if (SUBSCRIPTION_PLANS['pro_1y'] && proPrices['365_days']) SUBSCRIPTION_PLANS['pro_1y'].price = proPrices['365_days'];
+      if (SUBSCRIPTION_PLANS['pro_1d'] && proPrices['1_day']) {
+        SUBSCRIPTION_PLANS['pro_1d'].price = proPrices['1_day'];
+        SUBSCRIPTION_PLANS['pro_1d'].amountPaise = proPrices['1_day'] * 100;
+      }
+      if (SUBSCRIPTION_PLANS['pro_7d'] && proPrices['7_days']) {
+        SUBSCRIPTION_PLANS['pro_7d'].price = proPrices['7_days'];
+        SUBSCRIPTION_PLANS['pro_7d'].amountPaise = proPrices['7_days'] * 100;
+      }
+      if (SUBSCRIPTION_PLANS['pro_1m'] && proPrices['30_days']) {
+        SUBSCRIPTION_PLANS['pro_1m'].price = proPrices['30_days'];
+        SUBSCRIPTION_PLANS['pro_1m'].amountPaise = proPrices['30_days'] * 100;
+      }
+      if (SUBSCRIPTION_PLANS['pro_1y'] && proPrices['365_days']) {
+        SUBSCRIPTION_PLANS['pro_1y'].price = proPrices['365_days'];
+        SUBSCRIPTION_PLANS['pro_1y'].amountPaise = proPrices['365_days'] * 100;
+      }
     }
     if (pricing.trialOffer && pricing.trialOffer.price && SUBSCRIPTION_PLANS['launch_7d']) {
       SUBSCRIPTION_PLANS['launch_7d'].price = pricing.trialOffer.price;
+      SUBSCRIPTION_PLANS['launch_7d'].amountPaise = pricing.trialOffer.price * 100;
     }
 
     // Save to Firestore via Admin SDK if available
