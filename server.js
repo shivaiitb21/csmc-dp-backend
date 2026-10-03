@@ -1385,6 +1385,7 @@ app.post('/api/admin-reconcile', async (req, res) => {
         } catch (itemErr) {
           console.error(`[Reconcile] Error processing payment ${pid}:`, itemErr.message);
           errors++;
+          results.push({ paymentId: pid, status: 'error', error: itemErr.message });
         }
       }));
     }
