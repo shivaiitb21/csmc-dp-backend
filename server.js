@@ -1299,9 +1299,25 @@ app.post('/api/admin-reconcile', async (req, res) => {
   const results = [];
 
   try {
-    // Fetch last 200 Razorpay payments
-    const paymentList = await razorpay.payments.all({ count: 200 });
-    const payments = (paymentList && Array.isArray(paymentList.items)) ? paymentList.items : [];
+    // Fetch last up to 200 Razorpay payments across 2 pages (Razorpay max count per page is 100)
+    let payments = [];
+    try {
+      const page1 = await razorpay.payments.all({ count: 100, skip: 0 });
+      if (page1 && Array.isArray(page1.items)) {
+        payments = payments.concat(page1.items);
+      }
+      if (page1 && page1.items && page1.items.length === 100) {
+        const page2 = await razorpay.payments.all({ count: 100, skip: 100 });
+        if (page2 && Array.isArray(page2.items)) {
+          payments = payments.concat(page2.items);
+        }
+      }
+    } catch (fetchErr) {
+      const msg = fetchErr.error?.description || fetchErr.message || 'Razorpay payments fetch failed';
+      console.error('[Admin Reconcile] Razorpay error:', msg);
+      return res.status(500).json({ success: false, error: msg });
+    }
+
     total = payments.length;
 
     for (const p of payments) {
@@ -1377,8 +1393,9 @@ app.post('/api/admin-reconcile', async (req, res) => {
     console.log(`[Admin Reconcile] Done: ${synced} synced, ${skipped} skipped, ${errors} errors out of ${total} total`);
     return res.status(200).json({ success: true, synced, skipped, errors, total, results });
   } catch (err) {
-    console.error('[Admin Reconcile] Fatal error:', err.message);
-    return res.status(500).json({ success: false, error: err.message });
+    const errMsg = err.error?.description || err.message || String(err);
+    console.error('[Admin Reconcile] Fatal error:', errMsg);
+    return res.status(500).json({ success: false, error: errMsg });
   }
 });
 
