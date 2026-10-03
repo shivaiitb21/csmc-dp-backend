@@ -3,9 +3,83 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
+const fs = require('fs');
 const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+
+// Firebase Admin SDK for authoritative Firestore writes
+let adminDb = null;
+try {
+  const admin = require('firebase-admin');
+  if (!admin.apps.length) {
+    let serviceAccount = null;
+
+    // 1. Try env variable FIREBASE_SERVICE_ACCOUNT (raw JSON or base64)
+    const rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG_JSON;
+    if (rawEnv && rawEnv.trim()) {
+      const trimmed = rawEnv.trim();
+      try {
+        if (trimmed.startsWith('{')) {
+          serviceAccount = JSON.parse(trimmed);
+        } else {
+          // Attempt Base64 decode
+          const decoded = Buffer.from(trimmed, 'base64').toString('utf8');
+          serviceAccount = JSON.parse(decoded);
+        }
+      } catch (err) {
+        console.error('[Firebase] Error parsing FIREBASE_SERVICE_ACCOUNT env var:', err.message);
+      }
+    }
+
+    // 2. Try secret file locations (Render Secret Files, custom paths, or local file)
+    if (!serviceAccount) {
+      const candidatePaths = [
+        process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
+        process.env.GOOGLE_APPLICATION_CREDENTIALS,
+        '/etc/secrets/serviceAccount.json',
+        '/etc/secrets/FIREBASE_SERVICE_ACCOUNT',
+        path.join(__dirname, 'serviceAccount.json')
+      ].filter(Boolean);
+
+      for (const p of candidatePaths) {
+        if (fs.existsSync(p)) {
+          try {
+            const content = fs.readFileSync(p, 'utf8');
+            serviceAccount = JSON.parse(content);
+            console.log(`[Firebase] Loaded service account credentials from: ${p}`);
+            break;
+          } catch (e) {
+            console.warn(`[Firebase] Failed reading service account from ${p}:`, e.message);
+          }
+        }
+      }
+    }
+
+    if (serviceAccount && serviceAccount.private_key) {
+      // Fix private key newlines if they were escaped as string literal \n
+      if (typeof serviceAccount.private_key === 'string') {
+        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+      }
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        projectId: serviceAccount.project_id || 'csmc-dp-portal'
+      });
+      console.log('[Firebase] Admin SDK initialized successfully with service account');
+      adminDb = admin.firestore();
+    } else {
+      console.warn('[Firebase] No valid service account provided. Firestore writes will be skipped.');
+    }
+  } else {
+    adminDb = admin.firestore();
+  }
+  if (adminDb) {
+    console.log('[Firebase] Firestore connection ready');
+  }
+} catch (fbErr) {
+  console.warn('[Firebase] Admin SDK unavailable — Firestore writes will be skipped:', fbErr.message);
+}
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -123,6 +197,7 @@ const paymentApiLimiter = rateLimit({
   message: { error: "Too many checkout requests. Please wait a few minutes before trying again." }
 });
 app.use('/api/create-order', paymentApiLimiter);
+app.use('/api/create-razorpay-order', paymentApiLimiter);
 app.use('/api/verify-payment', paymentApiLimiter);
 
 // Body parsers with payload size caps to prevent memory exhaustion DoS
@@ -194,6 +269,19 @@ const razorpay = new Razorpay({
 const PROCESSED_PAYMENTS = new Map();
 // In-Memory Cache of Verified Subscriptions for Instant Restoration & Redundancy
 const VERIFIED_SUBSCRIPTIONS = new Map();
+// Single-Use Trial Phone Ledger (Ensures ₹9 trial pass cannot be claimed multiple times)
+const CLAIMED_TRIAL_PHONES = new Set();
+
+/**
+ * Standard Indian Mobile Normalizer: strips +91, 0, spaces, and dashes
+ */
+function normalizeIndianPhone(input) {
+  if (!input) return '';
+  const digits = String(input).replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) return digits.slice(2);
+  if (digits.length === 11 && digits.startsWith('0')) return digits.slice(1);
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+}
 
 // Evict entries older than 30 days every 2 hours
 setInterval(() => {
@@ -221,7 +309,7 @@ const SUBSCRIPTION_PLANS = {
     proTools: false,
     singleUse: true,
     badge: '3-Day Special Offer',
-    description: 'Introductory 3-day launch trial (ends Oct 4, 2026). Regular tariffs apply thereafter.'
+    description: 'Special 3-day introductory launch trial. Regular tariffs apply thereafter.'
   },
   'basic_1d': {
     id: 'basic_1d',
@@ -238,9 +326,9 @@ const SUBSCRIPTION_PLANS = {
     badge: 'Quick View',
     description: 'Basic map viewing valid strictly 24 hours from purchase'
   },
-  'basic_1w': {
-    id: 'basic_1w',
-    name: '1-Week Basic Pass',
+  'basic_7d': {
+    id: 'basic_7d',
+    name: '7-Day Basic Pass',
     tier: 'basic',
     scope: 'basic',
     durationDays: 7,
@@ -250,12 +338,12 @@ const SUBSCRIPTION_PLANS = {
     amountPaise: 9900,
     proTools: false,
     singleUse: false,
-    badge: 'Standard Weekly',
-    description: 'Full basic map viewing access for 7 days'
+    badge: 'Weekly Pass',
+    description: 'Basic map viewing valid for 7 full days from purchase'
   },
   'basic_1m': {
     id: 'basic_1m',
-    name: '1-Month Basic Pass',
+    name: 'Monthly Basic Pass',
     tier: 'basic',
     scope: 'basic',
     durationDays: 30,
@@ -265,24 +353,24 @@ const SUBSCRIPTION_PLANS = {
     amountPaise: 29900,
     proTools: false,
     singleUse: false,
-    badge: 'Popular',
-    description: 'Complete basic map viewing for 30 days across all sectors'
+    badge: 'Standard',
+    description: 'Unlimited HD DP Map view for 30 days'
   },
   'basic_1y': {
     id: 'basic_1y',
-    name: '1-Year Basic Pass',
+    name: 'Annual Basic Pass',
     tier: 'basic',
     scope: 'basic',
     durationDays: 365,
     durationHours: 8760,
     durationLabel: '1 Year',
-    price: 2999,
-    amountPaise: 299900,
+    price: 2499,
+    amountPaise: 249900,
     proTools: false,
     singleUse: false,
     badge: 'Best Value',
-    savings: 'Save ₹589',
-    description: 'Annual basic viewing access for architects & planners'
+    savings: 'Save ~30% · ~₹208/mo',
+    description: 'Unlimited HD DP Map view for 1 full year'
   },
   'pro_1d': {
     id: 'pro_1d',
@@ -299,9 +387,9 @@ const SUBSCRIPTION_PLANS = {
     badge: 'Pro Day Pass',
     description: 'Full GIS Pro measurement tools + DP view for strictly 24 hours'
   },
-  'pro_1w': {
-    id: 'pro_1w',
-    name: '1-Week Pro Pass',
+  'pro_7d': {
+    id: 'pro_7d',
+    name: '7-Day Pro Pass',
     tier: 'pro',
     scope: 'pro',
     durationDays: 7,
@@ -311,12 +399,12 @@ const SUBSCRIPTION_PLANS = {
     amountPaise: 24900,
     proTools: true,
     singleUse: false,
-    badge: 'Pro Weekly',
-    description: '7-day access to Distance, Area & Coordinates tools'
+    badge: 'Weekly Pro',
+    description: 'Full GIS Pro measurement tools + DP view for 7 days'
   },
   'pro_1m': {
     id: 'pro_1m',
-    name: '1-Month Pro Pass',
+    name: 'Monthly Pro Pass',
     tier: 'pro',
     scope: 'pro',
     durationDays: 30,
@@ -326,13 +414,13 @@ const SUBSCRIPTION_PLANS = {
     amountPaise: 59900,
     proTools: true,
     singleUse: false,
-    badge: 'Most Popular',
+    badge: 'Most Popular for Architects & Planners',
     savings: 'Best Seller',
-    description: 'Monthly unlimited access to all GIS Measurement Tools'
+    description: 'Full access to Polygon Area Measurement, GPS Coordinate Pinpoint & DP Maps for 30 days'
   },
   'pro_1y': {
     id: 'pro_1y',
-    name: '1-Year Pro Pass',
+    name: 'Annual Pro Pass',
     tier: 'pro',
     scope: 'pro',
     durationDays: 365,
@@ -343,10 +431,151 @@ const SUBSCRIPTION_PLANS = {
     proTools: true,
     singleUse: false,
     badge: 'Ultimate Value',
-    savings: 'Save ₹1,189',
-    description: 'Full 1-year unlimited GIS Pro access with priority updates'
+    savings: '~₹500/mo · Full Pro All Year',
+    description: 'Full 1-year unlimited GIS Pro access: Polygon Area, GPS Coordinates & all measurement tools'
   }
 };
+
+// =============================================================================
+// AUTHORITATIVE FIRESTORE PRICING ENGINE & FAIL-SAFE FALLBACKS
+// =============================================================================
+const DEFAULT_PRICING_CONFIG = {
+  trialOffer: {
+    enabled: true,
+    title: "7-Day Basic Access Trial Pass",
+    price: 9,
+    durationDays: 7,
+    badge: "Special 3-day offer",
+    daysRemaining: 3
+  },
+  tiers: {
+    basic: {
+      name: "Basic Map View",
+      prices: { "1_day": 49, "7_days": 99, "30_days": 299, "365_days": 2499 }
+    },
+    pro: {
+      name: "GIS Pro Tools (All-in-One)",
+      prices: { "1_day": 99, "7_days": 249, "30_days": 599, "365_days": 5999 }
+    }
+  },
+  features: {
+    basic: ["Superimposed Sanctioned DP Maps", "High-Res Satellite Hybrid Imagery", "Sector & Locality Search"],
+    pro: ["Road Distance Tracing", "Plot Polygon Area Measurement", "Lat/Lng Coordinate Jump & Pinpoint"]
+  }
+};
+
+let cachedPricing = null;
+let lastPricingFetch = 0;
+const PRICING_CACHE_TTL = 30000; // 30 seconds in-memory cache
+
+async function fetchAuthoritativePricing() {
+  const now = Date.now();
+  if (cachedPricing && (now - lastPricingFetch < PRICING_CACHE_TTL)) {
+    return cachedPricing;
+  }
+
+  try {
+    const firestoreUrl = 'https://firestore.googleapis.com/v1/projects/csmc-dp-portal/databases/(default)/documents/settings/pricing';
+    const response = await fetch(firestoreUrl, { signal: AbortSignal.timeout(4000) });
+    if (response.ok) {
+      const data = await response.json();
+      if (data && data.fields) {
+        function unwrap(f) {
+          if (!f) return null;
+          if ('stringValue' in f) return f.stringValue;
+          if ('integerValue' in f) return parseInt(f.integerValue, 10);
+          if ('doubleValue' in f) return parseFloat(f.doubleValue);
+          if ('booleanValue' in f) return f.booleanValue;
+          if ('mapValue' in f) {
+            const out = {};
+            const fields = f.mapValue.fields || {};
+            for (const k in fields) out[k] = unwrap(fields[k]);
+            return out;
+          }
+          if ('arrayValue' in f) {
+            return (f.arrayValue.values || []).map(unwrap);
+          }
+          return null;
+        }
+        const unwrapped = {};
+        for (const k in data.fields) unwrapped[k] = unwrap(data.fields[k]);
+        cachedPricing = { ...DEFAULT_PRICING_CONFIG, ...unwrapped };
+        lastPricingFetch = now;
+        return cachedPricing;
+      }
+    }
+  } catch (err) {
+    console.warn("Firestore pricing fetch warning (using default constants):", err.message);
+  }
+
+  return cachedPricing || DEFAULT_PRICING_CONFIG;
+}
+
+async function resolveAuthoritativePlan(planId, cadenceId) {
+  const cfg = await fetchAuthoritativePricing();
+
+  if (planId === 'launch_7d') {
+    const trial = cfg.trialOffer || DEFAULT_PRICING_CONFIG.trialOffer;
+    const price = trial.price !== undefined ? trial.price : 9;
+    const durDays = trial.durationDays || 7;
+    return {
+      id: 'launch_7d',
+      name: trial.title || 'Launch Special Trial',
+      price: price,
+      amountPaise: price * 100,
+      durationDays: durDays,
+      durationHours: durDays * 24,
+      scope: 'basic',
+      proTools: false,
+      singleUse: true,
+      trialEnabled: trial.enabled !== false
+    };
+  }
+
+  let tier = 'basic';
+  if (planId && (planId.startsWith('pro') || planId === 'pro')) {
+    tier = 'pro';
+  }
+
+  let cadence = '30_days';
+  if (cadenceId) {
+    if (cadenceId === '1d') cadence = '1_day';
+    else if (cadenceId === '7d') cadence = '7_days';
+    else if (cadenceId === '1m') cadence = '30_days';
+    else if (cadenceId === '1y') cadence = '365_days';
+    else cadence = cadenceId;
+  } else if (planId) {
+    if (planId.includes('1d')) cadence = '1_day';
+    else if (planId.includes('7d')) cadence = '7_days';
+    else if (planId.includes('1m') || planId.includes('30d')) cadence = '30_days';
+    else if (planId.includes('1y') || planId.includes('365d') || planId.includes('annual')) cadence = '365_days';
+  }
+
+  const tierPrices = (cfg.tiers && cfg.tiers[tier] && cfg.tiers[tier].prices) || DEFAULT_PRICING_CONFIG.tiers[tier].prices;
+  const price = tierPrices[cadence] !== undefined ? tierPrices[cadence] : (tier === 'pro' ? 599 : 299);
+
+  let days = 30;
+  if (cadence === '1_day') days = 1;
+  else if (cadence === '7_days') days = 7;
+  else if (cadence === '30_days') days = 30;
+  else if (cadence === '365_days') days = 365;
+
+  const tierName = cfg.tiers?.[tier]?.name || (tier === 'pro' ? 'GIS Pro Tools (All-in-One)' : 'Basic Map View');
+  const durLabel = days === 1 ? '1-Day' : (days === 7 ? '7-Day' : (days === 30 ? 'Monthly' : 'Annual'));
+  const planKey = `${tier}_${days === 1 ? '1d' : (days === 7 ? '7d' : (days === 30 ? '1m' : '1y'))}`;
+
+  return {
+    id: planKey,
+    name: `${durLabel} ${tierName}`,
+    price: price,
+    amountPaise: price * 100,
+    durationDays: days,
+    durationHours: days * 24,
+    scope: tier,
+    proTools: tier === 'pro',
+    singleUse: false
+  };
+}
 
 /**
  * Constant-time string comparison to protect against side-channel timing attacks
@@ -358,6 +587,43 @@ function secureCompare(a, b) {
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
 }
+
+/**
+ * Write verified subscription record to Firestore via Admin SDK.
+ * This is the authoritative server-side write that syncs to the admin panel.
+ */
+async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) {
+  if (!adminDb) {
+    console.warn('[Firestore] Admin SDK not available — skipping server-side Firestore write');
+    return;
+  }
+
+  try {
+    const admin = require('firebase-admin');
+    const recordWithTs = { ...subRecord, updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    const batch = adminDb.batch();
+
+    // 1. Audit ledger — immutable payment record keyed by payment ID
+    if (paymentId) {
+      batch.set(adminDb.collection('subscriptions').doc(paymentId), recordWithTs, { merge: true });
+    }
+
+    // 2. Active subscription profile keyed by phone (primary key for admin panel)
+    if (phone && phone.length === 10) {
+      batch.set(adminDb.collection('users_subscriptions').doc(phone), recordWithTs, { merge: true });
+    } else if (email) {
+      // Fallback: email-based key when phone unavailable
+      const emailKey = email.replace(/[@.]/g, '_');
+      batch.set(adminDb.collection('users_subscriptions').doc(emailKey), recordWithTs, { merge: true });
+    }
+
+    await batch.commit();
+    console.log(`[Firestore] Subscription provisioned — payment: ${paymentId}, phone: ${phone || '(none)'}, email: ${email || '(none)'}`);
+  } catch (err) {
+    console.error('[Firestore] Batch write failed:', err.message);
+  }
+}
+
 
 // -----------------------------------------------------------------------------
 // 6. API ENDPOINTS
@@ -373,7 +639,7 @@ app.get('/api/razorpay-key', (req, res) => {
 
 // Active Subscription Plans Schema
 app.get('/api/subscription-plans', (req, res) => {
-  const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-04T23:59:59+05:30').getTime();
+  const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-07T23:59:59+05:30').getTime();
   const isLaunchActive = Date.now() <= LAUNCH_OFFER_END_TIMESTAMP;
   const plansCopy = JSON.parse(JSON.stringify(SUBSCRIPTION_PLANS));
   if (!isLaunchActive && plansCopy['launch_7d']) {
@@ -389,21 +655,36 @@ app.get('/api/subscription-plans', (req, res) => {
 });
 
 // STEP 1: Create Order
-// POST /api/create-order
-// Server enforces plan pricing; prevents client-side price tampering
-app.post('/api/create-order', async (req, res) => {
+// POST /api/create-order & POST /api/create-razorpay-order
+// Server enforces plan pricing directly from Firestore; strictly prevents client-side price tampering
+const handleCreateOrder = async (req, res) => {
   try {
-    const { planId, userEmail, userPhone, userName, userCategory } = req.body;
+    const { planId, cadenceId, userEmail, userPhone, userName, userCategory } = req.body;
 
-    if (!planId || !SUBSCRIPTION_PLANS[planId]) {
+    if (!planId) {
+      return res.status(400).json({ error: "Missing required planId identifier." });
+    }
+
+    // Resolve authoritative server-side plan and tariff directly from Firestore settings/pricing
+    const plan = await resolveAuthoritativePlan(planId, cadenceId);
+    if (!plan) {
       return res.status(400).json({ error: "Invalid or unsupported plan identifier." });
     }
 
-    // 3-Day Introductory Launch Trial Expiry Enforcement (October 4, 2026, 23:59:59 IST)
-    const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-04T23:59:59+05:30').getTime();
-    if (planId === 'launch_7d' && Date.now() > LAUNCH_OFFER_END_TIMESTAMP) {
+    // Strict Server-Side Tamper Prevention: Reject client attempts to pass custom amount differing from authoritative rate
+    if (req.body.amount !== undefined) {
+      const clientAmount = Number(req.body.amount);
+      if (!isNaN(clientAmount) && clientAmount !== plan.amountPaise) {
+        return res.status(400).json({
+          error: "Price tampering detected. Authoritative tariffs are enforced directly from Firestore."
+        });
+      }
+    }
+
+    // Check if promotional trial offer is inactive in Firestore
+    if (plan.id === 'launch_7d' && plan.trialEnabled === false) {
       return res.status(400).json({
-        error: "The 3-day special trial offer (₹9 for 7 days) ended on October 4, 2026. Standard tariffs now apply."
+        error: "The promotional trial offer is currently inactive. Please choose a standard pass."
       });
     }
 
@@ -411,15 +692,28 @@ app.post('/api/create-order', async (req, res) => {
       return res.status(500).json({ error: "Payment processor credentials not configured on server." });
     }
 
-    const plan = SUBSCRIPTION_PLANS[planId];
-    // Enforce canonical amount strictly from the server-side pricing matrix
+    // Enforce canonical amount strictly from authoritative pricing
     const targetAmount = plan.amountPaise;
 
-    // Sanitize metadata fields
+    // Sanitize and normalize metadata fields
     const sanitizedEmail = String(userEmail || '').trim().toLowerCase().slice(0, 120);
-    const sanitizedPhone = String(userPhone || '').replace(/\D/g, '').slice(-10);
+    const sanitizedPhone = normalizeIndianPhone(userPhone);
     const sanitizedName = String(userName || 'Citizen User').slice(0, 80);
     const sanitizedCat = String(userCategory || 'Individual Citizen').slice(0, 80);
+
+    // Strict Single-Use Trial Pass Enforcement
+    if (plan.id === 'launch_7d') {
+      if (!sanitizedPhone || sanitizedPhone.length !== 10 || !/^[6-9]\d{9}$/.test(sanitizedPhone)) {
+        return res.status(400).json({
+          error: "A valid 10-digit Indian mobile number (starting with 6-9) is required to claim the single-use trial offer."
+        });
+      }
+      if (CLAIMED_TRIAL_PHONES.has(sanitizedPhone)) {
+        return res.status(400).json({
+          error: "This mobile number has already redeemed the introductory trial pass. Please choose a standard pass."
+        });
+      }
+    }
 
     const options = {
       amount: targetAmount,
@@ -431,6 +725,7 @@ app.post('/api/create-order', async (req, res) => {
         planId: plan.id,
         planName: plan.name,
         scope: plan.scope,
+        durationDays: String(plan.durationDays),
         amountPaise: String(targetAmount),
         userName: sanitizedName,
         userPhone: sanitizedPhone,
@@ -455,7 +750,10 @@ app.post('/api/create-order', async (req, res) => {
     console.error("Order creation error:", error.message || error);
     res.status(500).json({ error: "Failed to initialize order." });
   }
-});
+};
+
+app.post('/api/create-order', handleCreateOrder);
+app.post('/api/create-razorpay-order', handleCreateOrder);
 
 // STEP 2: Verify Payment Signature
 // POST /api/verify-payment
@@ -535,11 +833,23 @@ app.post('/api/verify-payment', async (req, res) => {
 
     // Cache verified subscription record in memory
     const userEmail = String(req.body.userEmail || '').trim().toLowerCase();
-    const userPhone = String(req.body.userPhone || '').replace(/\D/g, '').slice(-10);
+    const userPhone = normalizeIndianPhone(req.body.userPhone);
     const userName = String(req.body.userName || '').trim().slice(0, 80) || (userEmail ? userEmail.split('@')[0] : 'Pass Holder');
+
+    // Atomic Single-Use Trial Phone Enforcement
+    if (plan.id === 'launch_7d' && userPhone) {
+      CLAIMED_TRIAL_PHONES.add(userPhone);
+    }
+
+    const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
+    const isBasicTier = Boolean(!isProTier);
 
     VERIFIED_SUBSCRIPTIONS.set(paymentId, {
       isSubscribed: true,
+      role: isProTier ? 'pro' : 'basic',
+      tier: isProTier ? 'pro' : 'basic',
+      isPro: isProTier,
+      isBasic: isBasicTier,
       planId: plan.id,
       planName: plan.name,
       scope: plan.scope,
@@ -555,6 +865,41 @@ app.post('/api/verify-payment', async (req, res) => {
       name: userName
     });
 
+    // ====================================================================
+    // SERVER-SIDE FIRESTORE WRITE (Authoritative — survives server restarts)
+    // ====================================================================
+    const fsRecord = {
+      isSubscribed: true,
+      isProvisioned: true,
+      role: isProTier ? 'pro' : 'basic',
+      tier: isProTier ? 'pro' : 'basic',
+      isPro: isProTier,
+      isBasic: isBasicTier,
+      proToolsEnabled: Boolean(plan.proTools),
+      scope: plan.scope || 'basic',
+      planId: plan.id,
+      planName: plan.name,
+      price: plan.price,
+      paidAmount: plan.price,
+      planExpiry: new Date(expiryTimestamp).toISOString(),
+      purchaseTimestamp: now,
+      purchaseDate: new Date(now).toISOString(),
+      expiryTimestamp: expiryTimestamp,
+      expiryDate: new Date(expiryTimestamp).toISOString(),
+      paymentId: paymentId,
+      orderId: orderId,
+      phone: userPhone,
+      email: userEmail,
+      name: userName,
+      category: String(req.body.userCategory || 'Individual Citizen / Land Buyer').slice(0, 80),
+      hasUsedLaunchOffer: (plan.id === 'launch_7d')
+    };
+
+    // Fire-and-forget (don't await — response already sent)
+    writeSubscriptionToFirestore(fsRecord, paymentId, userPhone, userEmail).catch(e =>
+      console.warn('[Firestore] Background write error:', e.message)
+    );
+
     res.status(200).json({
       success: true,
       message: "Payment signature verified successfully",
@@ -563,7 +908,11 @@ app.post('/api/verify-payment', async (req, res) => {
       planId: plan.id,
       planName: plan.name,
       scope: plan.scope,
-      proToolsEnabled: plan.proTools,
+      tier: isProTier ? 'pro' : 'basic',
+      role: isProTier ? 'pro' : 'basic',
+      isPro: isProTier,
+      isBasic: isBasicTier,
+      proToolsEnabled: Boolean(plan.proTools),
       purchaseTimestamp: now,
       expiryTimestamp: expiryTimestamp,
       expiryDate: new Date(expiryTimestamp).toISOString()
@@ -607,7 +956,58 @@ app.post('/api/razorpay-webhook', (req, res) => {
       const paymentEntity = req.body.payload?.payment?.entity;
       const notes = paymentEntity?.notes || {};
       const pid = paymentEntity?.id;
-      if (pid) PROCESSED_PAYMENTS.set(pid, Date.now());
+      if (pid) {
+        PROCESSED_PAYMENTS.set(pid, Date.now());
+        const phone = normalizeIndianPhone(notes.userPhone || paymentEntity.contact);
+        const email = String(notes.userEmail || paymentEntity.email || '').toLowerCase().trim();
+        const name = String(notes.userName || 'Citizen User').slice(0, 80);
+        const category = String(notes.userCategory || notes.category || 'Individual Citizen / Land Buyer').slice(0, 80);
+        const orderId = String(paymentEntity.order_id || '').trim();
+        const amountRupees = Number(paymentEntity.amount || 0) / 100;
+        if (notes.planId === 'launch_7d' && phone) {
+          CLAIMED_TRIAL_PHONES.add(phone);
+        }
+
+        // Webhook Firestore write
+        const wPlanId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : 'basic_1m';
+        const wPlan = SUBSCRIPTION_PLANS[wPlanId];
+        const wNow = Date.now();
+        const wExpiry = wPlan.durationHours === 24
+          ? wNow + (24 * 60 * 60 * 1000)
+          : wNow + ((wPlan.durationDays || 30) * 24 * 60 * 60 * 1000);
+        const isProW = Boolean(wPlan.proTools || wPlan.scope === 'pro');
+
+        const wRecord = {
+          isSubscribed: true,
+          isProvisioned: true,
+          role: isProW ? 'pro' : 'basic',
+          tier: isProW ? 'pro' : 'basic',
+          isPro: isProW,
+          isBasic: !isProW,
+          proToolsEnabled: Boolean(wPlan.proTools),
+          scope: wPlan.scope || 'basic',
+          planId: wPlanId,
+          planName: notes.planName || wPlanId,
+          price: amountRupees,
+          paidAmount: amountRupees,
+          planExpiry: new Date(wExpiry).toISOString(),
+          purchaseTimestamp: wNow,
+          purchaseDate: new Date(wNow).toISOString(),
+          expiryTimestamp: wExpiry,
+          expiryDate: new Date(wExpiry).toISOString(),
+          paymentId: pid,
+          orderId: orderId,
+          phone: phone,
+          email: email,
+          name: name,
+          category: category,
+          hasUsedLaunchOffer: (wPlanId === 'launch_7d')
+        };
+
+        writeSubscriptionToFirestore(wRecord, pid, phone, email).catch(e =>
+          console.warn('[Webhook Firestore] Write error:', e.message)
+        );
+      }
       console.log(`[AUDIT] Webhook confirmed payment ${pid}, Plan: ${notes.planId}`);
     }
 
@@ -619,8 +1019,7 @@ app.post('/api/razorpay-webhook', (req, res) => {
 });
 
 // STEP 4: Subscription Lookup & Pass Restoration Endpoint
-// Supports Email, 10-digit Phone, or Razorpay Payment ID (pay_...)
-
+// Hardened with strict ownership verification: Payment ID alone CANNOT unlock a pass.
 function inferPlanFromPayment(p) {
   const planIdFromNotes = p.notes && p.notes.planId;
   if (planIdFromNotes && SUBSCRIPTION_PLANS[planIdFromNotes]) {
@@ -629,13 +1028,12 @@ function inferPlanFromPayment(p) {
   const amt = p.amount ? p.amount / 100 : 0;
   if (amt === 9) return SUBSCRIPTION_PLANS['launch_7d'];
   if (amt === 49) return SUBSCRIPTION_PLANS['basic_1d'];
-  if (amt === 99) {
-    if (p.notes?.scope === 'pro' || (p.description && p.description.toLowerCase().includes('pro'))) {
-      return SUBSCRIPTION_PLANS['pro_1d'];
-    }
-    return SUBSCRIPTION_PLANS['basic_1w'];
-  }
-  if (amt === 199 || amt === 249) return SUBSCRIPTION_PLANS['pro_1w'];
+  if (amt === 99) return SUBSCRIPTION_PLANS['pro_1d'];
+  if (amt === 249) return SUBSCRIPTION_PLANS['basic_1m'];
+  if (amt === 499) return SUBSCRIPTION_PLANS['pro_1m'];
+  if (amt === 1999) return SUBSCRIPTION_PLANS['basic_1y'];
+  if (amt === 3999) return SUBSCRIPTION_PLANS['pro_1y'];
+  // Fallbacks for legacy payments
   if (amt === 299) return SUBSCRIPTION_PLANS['basic_1m'];
   if (amt === 599) return SUBSCRIPTION_PLANS['pro_1m'];
   if (amt === 2999) return SUBSCRIPTION_PLANS['basic_1y'];
@@ -655,23 +1053,41 @@ async function handleSubscriptionLookup(req, res) {
   try {
     const params = req.method === 'GET' ? req.query : req.body;
     let rawEmail = String(params.email || '').trim().toLowerCase().slice(0, 120);
-    let rawPhone = String(params.phone || '').replace(/\D/g, '').slice(-10);
+    let rawPhone = normalizeIndianPhone(params.phone);
     let rawPayId = String(params.paymentId || params.payId || '').trim().slice(0, 80);
 
-    // If paymentId was passed in email field by mistake (e.g. pay_...)
+    // If paymentId was mistakenly passed in email field (e.g. pay_...)
     if (rawEmail.startsWith('pay_')) {
       rawPayId = rawEmail;
       rawEmail = '';
-    } else if (rawEmail.replace(/\D/g, '').length === 10 && !rawEmail.includes('@')) {
-      rawPhone = rawEmail.replace(/\D/g, '').slice(-10);
+    } else if (rawEmail.replace(/\D/g, '').length >= 10 && !rawEmail.includes('@')) {
+      rawPhone = normalizeIndianPhone(rawEmail);
       rawEmail = '';
     }
 
-    if (!rawEmail && !rawPhone && !rawPayId) {
+    // SECURITY HARDENING: Entering a Payment ID alone CANNOT unlock a pass without verifying
+    // matching ownership (via phone/email) to prevent guessing/brute-forcing payment identifiers.
+    if (!rawPayId && !rawEmail && !rawPhone) {
       return res.status(400).json({
         success: false,
         found: false,
-        error: "Please provide an email address, registered phone number, or payment ID."
+        error: "Please provide your registered email or phone number and Payment ID."
+      });
+    }
+
+    if (rawPayId && !rawEmail && !rawPhone) {
+      return res.status(400).json({
+        success: false,
+        found: false,
+        error: "Ownership verification required: To restore access via Payment ID, you must also provide the registered email address or mobile number used during purchase."
+      });
+    }
+
+    if (!rawPayId && (rawEmail || rawPhone)) {
+      return res.status(400).json({
+        success: false,
+        found: false,
+        error: "To restore access to your pass, please provide your Razorpay Payment ID along with your registered email or mobile number."
       });
     }
 
@@ -685,12 +1101,13 @@ async function handleSubscriptionLookup(req, res) {
     const candidates = [];
     const now = Date.now();
 
-    // 1. Check in-memory verified subscriptions cache
+    // 1. Check in-memory verified subscriptions cache with strict ownership match
     for (const sub of VERIFIED_SUBSCRIPTIONS.values()) {
       const emailMatch = rawEmail && rawEmail.includes('@') && sub.email && (sub.email === rawEmail || sub.email.includes(rawEmail));
-      const phoneMatch = rawPhone && rawPhone.length === 10 && sub.phone && sub.phone.endsWith(rawPhone);
+      const phoneMatch = rawPhone && rawPhone.length === 10 && sub.phone && (sub.phone === rawPhone || sub.phone.endsWith(rawPhone));
       const payMatch = rawPayId && sub.paymentId === rawPayId;
-      if (emailMatch || phoneMatch || payMatch) {
+
+      if (payMatch && (emailMatch || phoneMatch)) {
         const plan = SUBSCRIPTION_PLANS[sub.planId] || { id: sub.planId, name: sub.planName, scope: sub.scope, proTools: sub.proToolsEnabled, price: sub.price };
         candidates.push({
           plan,
@@ -706,31 +1123,39 @@ async function handleSubscriptionLookup(req, res) {
       }
     }
 
-    // 2. Direct fetch from Razorpay if paymentId provided
+    // 2. Direct fetch from Razorpay API with strict ownership match
     if (rawPayId && rawPayId.startsWith('pay_')) {
       try {
         const p = await razorpay.payments.fetch(rawPayId);
         if (p && (p.status === 'captured' || p.status === 'authorized')) {
-          const plan = inferPlanFromPayment(p);
-          const expiry = calculateExpiry(p, plan);
-          candidates.push({
-            plan,
-            expiryTimestamp: expiry,
-            isExpired: now >= expiry,
-            purchaseTimestamp: p.created_at * 1000,
-            paymentId: p.id,
-            orderId: p.order_id,
-            email: p.email || p.notes?.userEmail,
-            phone: p.contact || p.notes?.userPhone,
-            name: p.notes?.userName || (p.email ? p.email.split('@')[0] : 'Pass Holder')
-          });
+          const pEmail = String(p.email || p.notes?.userEmail || '').trim().toLowerCase();
+          const pPhone = normalizeIndianPhone(p.contact || p.notes?.userPhone);
+
+          const emailMatch = rawEmail && rawEmail.includes('@') && (pEmail === rawEmail || (rawEmail.length >= 5 && pEmail.includes(rawEmail)));
+          const phoneMatch = rawPhone && rawPhone.length === 10 && (pPhone === rawPhone || pPhone.endsWith(rawPhone));
+
+          if (emailMatch || phoneMatch) {
+            const plan = inferPlanFromPayment(p);
+            const expiry = calculateExpiry(p, plan);
+            candidates.push({
+              plan,
+              expiryTimestamp: expiry,
+              isExpired: now >= expiry,
+              purchaseTimestamp: p.created_at * 1000,
+              paymentId: p.id,
+              orderId: p.order_id,
+              email: pEmail,
+              phone: pPhone,
+              name: p.notes?.userName || (pEmail ? pEmail.split('@')[0] : 'Pass Holder')
+            });
+          }
         }
       } catch (fetchErr) {
         console.warn("Direct payment fetch notice:", fetchErr.message);
       }
     }
 
-    // 3. Scan recent Razorpay payments (last 100)
+    // 3. Scan recent Razorpay payments (last 100) with strict dual-match
     try {
       const paymentList = await razorpay.payments.all({ count: 100 });
       if (paymentList && Array.isArray(paymentList.items)) {
@@ -739,8 +1164,8 @@ async function handleSubscriptionLookup(req, res) {
 
           const pEmail = String(p.email || '').trim().toLowerCase();
           const pNotesEmail = String(p.notes?.userEmail || p.notes?.email || '').trim().toLowerCase();
-          const pPhone = String(p.contact || '').replace(/\D/g, '').slice(-10);
-          const pNotesPhone = String(p.notes?.userPhone || p.notes?.phone || '').replace(/\D/g, '').slice(-10);
+          const pPhone = normalizeIndianPhone(p.contact);
+          const pNotesPhone = normalizeIndianPhone(p.notes?.userPhone || p.notes?.phone);
           const pId = String(p.id || '').trim();
 
           const emailMatch = rawEmail && rawEmail.includes('@') && (
@@ -755,7 +1180,8 @@ async function handleSubscriptionLookup(req, res) {
           );
           const payMatch = rawPayId && pId === rawPayId;
 
-          if (emailMatch || phoneMatch || payMatch) {
+          // STRICT CHECK: Both payment ID and verified email/phone must match!
+          if (payMatch && (emailMatch || phoneMatch)) {
             if (!candidates.some(c => c.paymentId === p.id)) {
               const plan = inferPlanFromPayment(p);
               const expiry = calculateExpiry(p, plan);
@@ -767,7 +1193,7 @@ async function handleSubscriptionLookup(req, res) {
                 paymentId: p.id,
                 orderId: p.order_id,
                 email: p.email || p.notes?.userEmail || rawEmail,
-                phone: p.contact || p.notes?.userPhone || rawPhone,
+                phone: pPhone || rawPhone,
                 name: p.notes?.userName || (p.email ? p.email.split('@')[0] : 'Pass Holder')
               });
             }
@@ -840,17 +1266,135 @@ async function handleSubscriptionLookup(req, res) {
 app.post('/api/lookup-subscription', handleSubscriptionLookup);
 app.get('/api/lookup-subscription', handleSubscriptionLookup);
 
+// =============================================================================
+// ADMIN: RAZORPAY → FIRESTORE RECONCILIATION ENDPOINT
+// POST /api/admin-reconcile
+// Scans Razorpay payment history and provisions any captured payments
+// that are missing from Firestore's users_subscriptions collection.
+// This fixes users who paid before the Firestore write bug was patched.
+// =============================================================================
+app.post('/api/admin-reconcile', async (req, res) => {
+  // Simple admin key guard — upgrade to proper admin auth in production
+  const ADMIN_RECONCILE_KEY = process.env.ADMIN_RECONCILE_KEY || 'csmc_admin_reconcile_2024';
+  const { adminKey } = req.body;
+  if (adminKey !== ADMIN_RECONCILE_KEY) {
+    return res.status(403).json({ error: 'Unauthorized: invalid admin key.' });
+  }
+
+  if (!adminDb) {
+    return res.status(503).json({
+      error: 'Firestore Admin SDK not initialized. Please set FIREBASE_SERVICE_ACCOUNT env var on Render and redeploy.',
+      hint: 'Go to Render dashboard → csmc-dp-backend → Environment → Add FIREBASE_SERVICE_ACCOUNT as the JSON content of your Firebase service account key.'
+    });
+  }
+
+  if (!key_id || !key_secret) {
+    return res.status(503).json({ error: 'Razorpay credentials not configured.' });
+  }
+
+  let synced = 0;
+  let skipped = 0;
+  let errors = 0;
+  let total = 0;
+  const results = [];
+
+  try {
+    // Fetch last 200 Razorpay payments
+    const paymentList = await razorpay.payments.all({ count: 200 });
+    const payments = (paymentList && Array.isArray(paymentList.items)) ? paymentList.items : [];
+    total = payments.length;
+
+    for (const p of payments) {
+      if (p.status !== 'captured' && p.status !== 'authorized') continue;
+
+      const pid = p.id;
+      const notes = p.notes || {};
+      const phone = normalizeIndianPhone(notes.userPhone || notes.phone || p.contact);
+      const email = String(notes.userEmail || notes.email || p.email || '').toLowerCase().trim();
+      const name = String(notes.userName || notes.name || (email ? email.split('@')[0] : 'Citizen User')).slice(0, 80);
+      const category = String(notes.userCategory || notes.category || 'Individual Citizen / Land Buyer').slice(0, 80);
+
+      try {
+        // Check if already provisioned
+        const existingDoc = await adminDb.collection('subscriptions').doc(pid).get();
+        if (existingDoc.exists && existingDoc.data().isProvisioned) {
+          skipped++;
+          continue;
+        }
+
+        const planId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : inferPlanFromPayment(p)?.id || 'basic_1m';
+        const plan = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS['basic_1m'];
+
+        const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
+        let expiryTimestamp;
+        if (plan.durationHours === 24) {
+          expiryTimestamp = purchaseMs + (24 * 60 * 60 * 1000);
+        } else {
+          expiryTimestamp = purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
+        }
+
+        const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
+        const amountRupees = Number(p.amount || 0) / 100;
+
+        const subRecord = {
+          isSubscribed: true,
+          isProvisioned: true,
+          role: isProTier ? 'pro' : 'basic',
+          tier: isProTier ? 'pro' : 'basic',
+          isPro: isProTier,
+          isBasic: !isProTier,
+          proToolsEnabled: Boolean(plan.proTools),
+          scope: plan.scope || 'basic',
+          planId,
+          planName: notes.planName || plan.name || planId,
+          price: amountRupees,
+          paidAmount: amountRupees,
+          planExpiry: new Date(expiryTimestamp).toISOString(),
+          purchaseTimestamp: purchaseMs,
+          purchaseDate: new Date(purchaseMs).toISOString(),
+          expiryTimestamp,
+          expiryDate: new Date(expiryTimestamp).toISOString(),
+          paymentId: pid,
+          orderId: p.order_id || '',
+          phone,
+          email,
+          name,
+          category,
+          hasUsedLaunchOffer: (planId === 'launch_7d'),
+          reconciledAt: new Date().toISOString(),
+          reconcileSource: 'admin-reconcile-endpoint'
+        };
+
+        await writeSubscriptionToFirestore(subRecord, pid, phone, email);
+        synced++;
+        results.push({ paymentId: pid, phone, email, plan: planId, status: 'synced' });
+      } catch (itemErr) {
+        console.error(`[Reconcile] Error processing payment ${pid}:`, itemErr.message);
+        errors++;
+      }
+    }
+
+    console.log(`[Admin Reconcile] Done: ${synced} synced, ${skipped} skipped, ${errors} errors out of ${total} total`);
+    return res.status(200).json({ success: true, synced, skipped, errors, total, results });
+  } catch (err) {
+    console.error('[Admin Reconcile] Fatal error:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: "healthy",
     service: "CSMC Razorpay API",
+    firebaseAdmin: Boolean(adminDb),
     plansCount: Object.keys(SUBSCRIPTION_PLANS).length,
     timestamp: new Date().toISOString()
   });
 });
 
-// Root endpoint
+// Root endpoint: API Status & Directory
 app.get('/', (req, res) => {
   res.json({
     status: "online",
