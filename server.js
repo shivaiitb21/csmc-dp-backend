@@ -1328,72 +1328,68 @@ app.post('/api/admin-reconcile', async (req, res) => {
         const name = String(notes.userName || notes.name || (email ? email.split('@')[0] : 'Citizen User')).slice(0, 80);
         const category = String(notes.userCategory || notes.category || 'Individual Citizen / Land Buyer').slice(0, 80);
 
+        const planId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : inferPlanFromPayment(p)?.id || 'basic_1m';
+        const plan = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS['basic_1m'];
+
+        const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
+        let expiryTimestamp;
+        if (plan.durationHours === 24) {
+          expiryTimestamp = purchaseMs + (24 * 60 * 60 * 1000);
+        } else {
+          expiryTimestamp = purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
+        }
+
+        const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
+        const amountRupees = Number(p.amount || 0) / 100;
+
+        const subRecord = {
+          isSubscribed: true,
+          isProvisioned: true,
+          role: isProTier ? 'pro' : 'basic',
+          tier: isProTier ? 'pro' : 'basic',
+          isPro: isProTier,
+          isBasic: !isProTier,
+          proToolsEnabled: Boolean(plan.proTools),
+          scope: plan.scope || 'basic',
+          planId,
+          planName: notes.planName || plan.name || planId,
+          price: amountRupees,
+          paidAmount: amountRupees,
+          planExpiry: new Date(expiryTimestamp).toISOString(),
+          purchaseTimestamp: purchaseMs,
+          purchaseDate: new Date(purchaseMs).toISOString(),
+          expiryTimestamp,
+          expiryDate: new Date(expiryTimestamp).toISOString(),
+          paymentId: pid,
+          orderId: p.order_id || '',
+          phone,
+          email,
+          name,
+          category,
+          hasUsedLaunchOffer: (planId === 'launch_7d'),
+          reconciledAt: new Date().toISOString(),
+          reconcileSource: 'admin-reconcile-endpoint'
+        };
+
+        // Attempt Firestore persistence (gracefully handles Spark tier quota limits)
+        let writeStatus = 'synced';
         try {
-          // Check if already provisioned
           const existingDoc = await adminDb.collection('subscriptions').doc(pid).get();
           if (existingDoc.exists && existingDoc.data().isProvisioned) {
             skipped++;
+            results.push({ ...subRecord, status: 'already_provisioned' });
             return;
           }
-
-          const planId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : inferPlanFromPayment(p)?.id || 'basic_1m';
-          const plan = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS['basic_1m'];
-
-          const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
-          let expiryTimestamp;
-          if (plan.durationHours === 24) {
-            expiryTimestamp = purchaseMs + (24 * 60 * 60 * 1000);
-          } else {
-            expiryTimestamp = purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
-          }
-
-          const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
-          const amountRupees = Number(p.amount || 0) / 100;
-
-          const subRecord = {
-            isSubscribed: true,
-            isProvisioned: true,
-            role: isProTier ? 'pro' : 'basic',
-            tier: isProTier ? 'pro' : 'basic',
-            isPro: isProTier,
-            isBasic: !isProTier,
-            proToolsEnabled: Boolean(plan.proTools),
-            scope: plan.scope || 'basic',
-            planId,
-            planName: notes.planName || plan.name || planId,
-            price: amountRupees,
-            paidAmount: amountRupees,
-            planExpiry: new Date(expiryTimestamp).toISOString(),
-            purchaseTimestamp: purchaseMs,
-            purchaseDate: new Date(purchaseMs).toISOString(),
-            expiryTimestamp,
-            expiryDate: new Date(expiryTimestamp).toISOString(),
-            paymentId: pid,
-            orderId: p.order_id || '',
-            phone,
-            email,
-            name,
-            category,
-            hasUsedLaunchOffer: (planId === 'launch_7d'),
-            reconciledAt: new Date().toISOString(),
-            reconcileSource: 'admin-reconcile-endpoint'
-          };
-
-          let writeStatus = 'synced';
-          try {
-            await writeSubscriptionToFirestore(subRecord, pid, phone, email);
-            synced++;
-          } catch (writeErr) {
-            console.warn(`[Reconcile] Firestore write error for ${pid}:`, writeErr.message);
-            writeStatus = writeErr.message.includes('RESOURCE_EXHAUSTED') ? 'quota_exceeded' : 'write_failed';
-            errors++;
-          }
-          results.push({ ...subRecord, status: writeStatus });
-        } catch (itemErr) {
-          console.error(`[Reconcile] Error processing payment ${pid}:`, itemErr.message);
+          await writeSubscriptionToFirestore(subRecord, pid, phone, email);
+          synced++;
+        } catch (fsErr) {
+          const isQuota = (fsErr.message || '').includes('RESOURCE_EXHAUSTED') || (fsErr.code === 8);
+          writeStatus = isQuota ? 'quota_exceeded' : 'write_failed';
           errors++;
-          results.push({ paymentId: pid, status: 'error', error: itemErr.message });
+          console.warn(`[Reconcile] Firestore operation failed for ${pid}:`, fsErr.message);
         }
+
+        results.push({ ...subRecord, status: writeStatus });
       }));
     }
 
