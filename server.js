@@ -608,13 +608,60 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
       batch.set(adminDb.collection('subscriptions').doc(paymentId), recordWithTs, { merge: true });
     }
 
-    // 2. Active subscription profile keyed by phone (primary key for admin panel)
-    if (phone && phone.length === 10) {
-      batch.set(adminDb.collection('users_subscriptions').doc(phone), recordWithTs, { merge: true });
-    } else if (email) {
-      // Fallback: email-based key when phone unavailable
-      const emailKey = email.replace(/[@.]/g, '_');
-      batch.set(adminDb.collection('users_subscriptions').doc(emailKey), recordWithTs, { merge: true });
+    // 2. Active subscription profile keyed by phone or email with multi-tier stacking
+    const targetDocId = (phone && phone.length === 10) ? phone : (email ? email.replace(/[@.]/g, '_') : null);
+    if (targetDocId) {
+      let mergedProfile = { ...recordWithTs };
+      try {
+        const existingDoc = await adminDb.collection('users_subscriptions').doc(targetDocId).get();
+        if (existingDoc.exists) {
+          const oldData = existingDoc.data() || {};
+          const now = Date.now();
+
+          const isNewPro = Boolean(subRecord.isPro || subRecord.scope === 'pro');
+          const oldProExp = oldData.proExpiryTimestamp || (oldData.isPro && oldData.expiryTimestamp ? Number(oldData.expiryTimestamp) : 0);
+          const oldBasicExp = oldData.basicExpiryTimestamp || (!oldData.isPro && oldData.expiryTimestamp ? Number(oldData.expiryTimestamp) : 0);
+
+          let newProExp = isNewPro ? Number(subRecord.expiryTimestamp) : oldProExp;
+          let newBasicExp = !isNewPro ? Number(subRecord.expiryTimestamp) : oldBasicExp;
+
+          if (isNewPro && oldProExp > now) {
+            newProExp = Math.max(oldProExp, Number(subRecord.expiryTimestamp));
+          }
+          if (!isNewPro && oldBasicExp > now) {
+            newBasicExp = Math.max(oldBasicExp, Number(subRecord.expiryTimestamp));
+          }
+
+          const maxExp = Math.max(newProExp || 0, newBasicExp || 0, Number(subRecord.expiryTimestamp || 0));
+          const totalPaid = Number(oldData.paidAmount || oldData.price || 0) + Number(subRecord.paidAmount || subRecord.price || 0);
+
+          const hasActivePro = Boolean(newProExp && newProExp > now);
+          const hasActiveBasic = Boolean(newBasicExp && newBasicExp > now);
+
+          mergedProfile = {
+            ...oldData,
+            ...recordWithTs,
+            paidAmount: totalPaid,
+            price: totalPaid,
+            proExpiryDate: newProExp ? new Date(newProExp).toISOString() : (oldData.proExpiryDate || null),
+            proExpiryTimestamp: newProExp || null,
+            basicExpiryDate: newBasicExp ? new Date(newBasicExp).toISOString() : (oldData.basicExpiryDate || null),
+            basicExpiryTimestamp: newBasicExp || null,
+            expiryTimestamp: maxExp,
+            expiryDate: new Date(maxExp).toISOString(),
+            planExpiry: new Date(maxExp).toISOString(),
+            isPro: hasActivePro,
+            proToolsEnabled: hasActivePro,
+            role: hasActivePro ? 'pro' : (hasActiveBasic ? 'basic' : 'free'),
+            scope: hasActivePro ? 'pro' : (hasActiveBasic ? 'basic' : 'basic'),
+            planName: (hasActivePro && hasActiveBasic) ? `${subRecord.planName} (+ Active Basic)` : subRecord.planName
+          };
+        }
+      } catch (mergeErr) {
+        console.warn('[Firestore] Error merging stacked subscription profile:', mergeErr.message);
+      }
+
+      batch.set(adminDb.collection('users_subscriptions').doc(targetDocId), mergedProfile, { merge: true });
     }
 
     await batch.commit();
