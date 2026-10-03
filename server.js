@@ -201,7 +201,13 @@ app.use('/api/create-razorpay-order', paymentApiLimiter);
 app.use('/api/verify-payment', paymentApiLimiter);
 
 // Body parsers with payload size caps to prevent memory exhaustion DoS
-app.use(express.json({ limit: '100kb' }));
+// Capture rawBody for deterministic cryptographic webhook verification
+app.use(express.json({
+  limit: '100kb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
 // -----------------------------------------------------------------------------
@@ -664,6 +670,26 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
       batch.set(adminDb.collection('users_subscriptions').doc(targetDocId), mergedProfile, { merge: true });
     }
 
+    // 3. Authoritatively sync entitlements to users/{userId} (if uid provided)
+    const uId = subRecord.userId || subRecord.uid;
+    if (uId) {
+      batch.set(adminDb.collection('users').doc(uId), {
+        role: subRecord.role || 'basic',
+        isPro: Boolean(subRecord.isPro),
+        tier: subRecord.tier || 'basic',
+        isSubscribed: true,
+        proToolsEnabled: Boolean(subRecord.proToolsEnabled),
+        planId: subRecord.planId,
+        planName: subRecord.planName,
+        planExpiry: subRecord.planExpiry,
+        expiryTimestamp: subRecord.expiryTimestamp,
+        expiryDate: subRecord.expiryDate,
+        paymentId: subRecord.paymentId,
+        orderId: subRecord.orderId,
+        updatedAt: recordWithTs.updatedAt
+      }, { merge: true });
+    }
+
     await batch.commit();
     console.log(`[Firestore] Subscription provisioned — payment: ${paymentId}, phone: ${phone || '(none)'}, email: ${email || '(none)'}`);
   } catch (err) {
@@ -939,6 +965,7 @@ app.post('/api/verify-payment', async (req, res) => {
       email: userEmail,
       name: userName,
       category: String(req.body.userCategory || 'Individual Citizen / Land Buyer').slice(0, 80),
+      userId: String(req.body.userId || req.body.uid || '').trim() || null,
       hasUsedLaunchOffer: (plan.id === 'launch_7d')
     };
 
@@ -987,7 +1014,7 @@ app.post('/api/razorpay-webhook', (req, res) => {
       return res.status(500).json({ error: "Webhook secret not configured on server." });
     }
 
-    const payload = JSON.stringify(req.body);
+    const payload = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body);
     const expectedSignature = crypto
       .createHmac('sha256', secret)
       .update(payload)
@@ -1313,6 +1340,54 @@ async function handleSubscriptionLookup(req, res) {
 app.post('/api/lookup-subscription', handleSubscriptionLookup);
 app.get('/api/lookup-subscription', handleSubscriptionLookup);
 
+// Authorized administrator email whitelist
+const AUTHORIZED_ADMIN_EMAILS = [
+  'admin@csmc.gov.in',
+  'shivdeveloper4@gmail.com'
+];
+
+/**
+ * Dual-Mode Admin Authorization Middleware
+ * Supports:
+ * 1. Cryptographically verified Firebase ID Tokens (Authorization: Bearer <token>)
+ * 2. High-entropy ADMIN_RECONCILE_KEY fallback in headers or body for backward compatibility
+ */
+async function verifyAdminAuth(req, res, next) {
+  const ADMIN_RECONCILE_KEY = process.env.ADMIN_RECONCILE_KEY || 'csmc_admin_reconcile_2024';
+
+  // 1. Try Firebase Auth Bearer ID Token if provided
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const idToken = authHeader.split('Bearer ')[1].trim();
+    if (idToken) {
+      try {
+        const admin = require('firebase-admin');
+        if (admin.apps.length) {
+          const decoded = await admin.auth().verifyIdToken(idToken);
+          if (decoded) {
+            const email = (decoded.email || '').toLowerCase().trim();
+            const isAdmin = decoded.admin === true || (decoded.email_verified && AUTHORIZED_ADMIN_EMAILS.includes(email));
+            if (isAdmin) {
+              req.adminUser = decoded;
+              return next();
+            }
+          }
+        }
+      } catch (tokenErr) {
+        console.warn('[Admin Auth] ID Token verification notice:', tokenErr.message);
+      }
+    }
+  }
+
+  // 2. Dual-mode fallback: Check adminKey in request body or header for backward compatibility
+  const providedKey = req.body?.adminKey || req.headers['x-admin-key'];
+  if (providedKey && providedKey === ADMIN_RECONCILE_KEY) {
+    return next();
+  }
+
+  return res.status(403).json({ error: 'Unauthorized: Admin authentication or valid admin key required.' });
+}
+
 // =============================================================================
 // ADMIN: RAZORPAY → FIRESTORE RECONCILIATION ENDPOINT
 // POST /api/admin-reconcile
@@ -1320,13 +1395,7 @@ app.get('/api/lookup-subscription', handleSubscriptionLookup);
 // that are missing from Firestore's users_subscriptions collection.
 // This fixes users who paid before the Firestore write bug was patched.
 // =============================================================================
-app.post('/api/admin-reconcile', async (req, res) => {
-  // Simple admin key guard — upgrade to proper admin auth in production
-  const ADMIN_RECONCILE_KEY = process.env.ADMIN_RECONCILE_KEY || 'csmc_admin_reconcile_2024';
-  const { adminKey } = req.body;
-  if (adminKey !== ADMIN_RECONCILE_KEY) {
-    return res.status(403).json({ error: 'Unauthorized: invalid admin key.' });
-  }
+app.post('/api/admin-reconcile', verifyAdminAuth, async (req, res) => {
 
   if (!adminDb) {
     return res.status(503).json({
@@ -1447,6 +1516,7 @@ app.post('/api/admin-reconcile', async (req, res) => {
     const errMsg = err.error?.description || err.message || String(err);
     console.error('[Admin Reconcile] Fatal error:', errMsg);
     return res.status(500).json({ success: false, error: errMsg });
+  }
 });
 
 // =============================================================================
@@ -1454,12 +1524,8 @@ app.post('/api/admin-reconcile', async (req, res) => {
 // POST /api/admin-pricing
 // Updates in-memory plans and syncs to settings/pricing in Firestore via Admin SDK.
 // =============================================================================
-app.post('/api/admin-pricing', async (req, res) => {
-  const ADMIN_RECONCILE_KEY = process.env.ADMIN_RECONCILE_KEY || 'csmc_admin_reconcile_2024';
-  const { adminKey, pricing } = req.body;
-  if (adminKey !== ADMIN_RECONCILE_KEY) {
-    return res.status(403).json({ error: 'Unauthorized: invalid admin key.' });
-  }
+app.post('/api/admin-pricing', verifyAdminAuth, async (req, res) => {
+  const { pricing } = req.body;
   if (!pricing) {
     return res.status(400).json({ error: 'Pricing payload required.' });
   }
