@@ -1299,18 +1299,13 @@ app.post('/api/admin-reconcile', async (req, res) => {
   const results = [];
 
   try {
-    // Fetch last up to 200 Razorpay payments across 2 pages (Razorpay max count per page is 100)
+    const limit = Math.min(Math.max(parseInt(req.body.limit, 10) || 50, 1), 100);
+    // Fetch last payments from Razorpay
     let payments = [];
     try {
-      const page1 = await razorpay.payments.all({ count: 100, skip: 0 });
-      if (page1 && Array.isArray(page1.items)) {
-        payments = payments.concat(page1.items);
-      }
-      if (page1 && page1.items && page1.items.length === 100) {
-        const page2 = await razorpay.payments.all({ count: 100, skip: 100 });
-        if (page2 && Array.isArray(page2.items)) {
-          payments = payments.concat(page2.items);
-        }
+      const page = await razorpay.payments.all({ count: limit, skip: 0 });
+      if (page && Array.isArray(page.items)) {
+        payments = page.items;
       }
     } catch (fetchErr) {
       const msg = fetchErr.error?.description || fetchErr.message || 'Razorpay payments fetch failed';
@@ -1318,76 +1313,80 @@ app.post('/api/admin-reconcile', async (req, res) => {
       return res.status(500).json({ success: false, error: msg });
     }
 
-    total = payments.length;
+    const validPayments = payments.filter(p => p.status === 'captured' || p.status === 'authorized');
+    total = validPayments.length;
 
-    for (const p of payments) {
-      if (p.status !== 'captured' && p.status !== 'authorized') continue;
+    // Process in batches of 10 concurrent requests to prevent timeout
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < validPayments.length; i += BATCH_SIZE) {
+      const chunk = validPayments.slice(i, i + BATCH_SIZE);
+      await Promise.all(chunk.map(async (p) => {
+        const pid = p.id;
+        const notes = p.notes || {};
+        const phone = normalizeIndianPhone(notes.userPhone || notes.phone || p.contact);
+        const email = String(notes.userEmail || notes.email || p.email || '').toLowerCase().trim();
+        const name = String(notes.userName || notes.name || (email ? email.split('@')[0] : 'Citizen User')).slice(0, 80);
+        const category = String(notes.userCategory || notes.category || 'Individual Citizen / Land Buyer').slice(0, 80);
 
-      const pid = p.id;
-      const notes = p.notes || {};
-      const phone = normalizeIndianPhone(notes.userPhone || notes.phone || p.contact);
-      const email = String(notes.userEmail || notes.email || p.email || '').toLowerCase().trim();
-      const name = String(notes.userName || notes.name || (email ? email.split('@')[0] : 'Citizen User')).slice(0, 80);
-      const category = String(notes.userCategory || notes.category || 'Individual Citizen / Land Buyer').slice(0, 80);
+        try {
+          // Check if already provisioned
+          const existingDoc = await adminDb.collection('subscriptions').doc(pid).get();
+          if (existingDoc.exists && existingDoc.data().isProvisioned) {
+            skipped++;
+            return;
+          }
 
-      try {
-        // Check if already provisioned
-        const existingDoc = await adminDb.collection('subscriptions').doc(pid).get();
-        if (existingDoc.exists && existingDoc.data().isProvisioned) {
-          skipped++;
-          continue;
+          const planId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : inferPlanFromPayment(p)?.id || 'basic_1m';
+          const plan = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS['basic_1m'];
+
+          const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
+          let expiryTimestamp;
+          if (plan.durationHours === 24) {
+            expiryTimestamp = purchaseMs + (24 * 60 * 60 * 1000);
+          } else {
+            expiryTimestamp = purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
+          }
+
+          const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
+          const amountRupees = Number(p.amount || 0) / 100;
+
+          const subRecord = {
+            isSubscribed: true,
+            isProvisioned: true,
+            role: isProTier ? 'pro' : 'basic',
+            tier: isProTier ? 'pro' : 'basic',
+            isPro: isProTier,
+            isBasic: !isProTier,
+            proToolsEnabled: Boolean(plan.proTools),
+            scope: plan.scope || 'basic',
+            planId,
+            planName: notes.planName || plan.name || planId,
+            price: amountRupees,
+            paidAmount: amountRupees,
+            planExpiry: new Date(expiryTimestamp).toISOString(),
+            purchaseTimestamp: purchaseMs,
+            purchaseDate: new Date(purchaseMs).toISOString(),
+            expiryTimestamp,
+            expiryDate: new Date(expiryTimestamp).toISOString(),
+            paymentId: pid,
+            orderId: p.order_id || '',
+            phone,
+            email,
+            name,
+            category,
+            hasUsedLaunchOffer: (planId === 'launch_7d'),
+            reconciledAt: new Date().toISOString(),
+            reconcileSource: 'admin-reconcile-endpoint'
+          };
+
+          await writeSubscriptionToFirestore(subRecord, pid, phone, email);
+          synced++;
+          results.push({ paymentId: pid, phone, email, plan: planId, status: 'synced' });
+        } catch (itemErr) {
+          console.error(`[Reconcile] Error processing payment ${pid}:`, itemErr.message);
+          errors++;
         }
-
-        const planId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : inferPlanFromPayment(p)?.id || 'basic_1m';
-        const plan = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS['basic_1m'];
-
-        const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
-        let expiryTimestamp;
-        if (plan.durationHours === 24) {
-          expiryTimestamp = purchaseMs + (24 * 60 * 60 * 1000);
-        } else {
-          expiryTimestamp = purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
-        }
-
-        const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
-        const amountRupees = Number(p.amount || 0) / 100;
-
-        const subRecord = {
-          isSubscribed: true,
-          isProvisioned: true,
-          role: isProTier ? 'pro' : 'basic',
-          tier: isProTier ? 'pro' : 'basic',
-          isPro: isProTier,
-          isBasic: !isProTier,
-          proToolsEnabled: Boolean(plan.proTools),
-          scope: plan.scope || 'basic',
-          planId,
-          planName: notes.planName || plan.name || planId,
-          price: amountRupees,
-          paidAmount: amountRupees,
-          planExpiry: new Date(expiryTimestamp).toISOString(),
-          purchaseTimestamp: purchaseMs,
-          purchaseDate: new Date(purchaseMs).toISOString(),
-          expiryTimestamp,
-          expiryDate: new Date(expiryTimestamp).toISOString(),
-          paymentId: pid,
-          orderId: p.order_id || '',
-          phone,
-          email,
-          name,
-          category,
-          hasUsedLaunchOffer: (planId === 'launch_7d'),
-          reconciledAt: new Date().toISOString(),
-          reconcileSource: 'admin-reconcile-endpoint'
-        };
-
-        await writeSubscriptionToFirestore(subRecord, pid, phone, email);
-        synced++;
-        results.push({ paymentId: pid, phone, email, plan: planId, status: 'synced' });
-      } catch (itemErr) {
-        console.error(`[Reconcile] Error processing payment ${pid}:`, itemErr.message);
-        errors++;
-      }
+      }));
     }
 
     console.log(`[Admin Reconcile] Done: ${synced} synced, ${skipped} skipped, ${errors} errors out of ${total} total`);
