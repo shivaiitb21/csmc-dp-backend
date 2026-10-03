@@ -1379,9 +1379,16 @@ app.post('/api/admin-reconcile', async (req, res) => {
             reconcileSource: 'admin-reconcile-endpoint'
           };
 
-          await writeSubscriptionToFirestore(subRecord, pid, phone, email);
-          synced++;
-          results.push({ paymentId: pid, phone, email, plan: planId, status: 'synced' });
+          let writeStatus = 'synced';
+          try {
+            await writeSubscriptionToFirestore(subRecord, pid, phone, email);
+            synced++;
+          } catch (writeErr) {
+            console.warn(`[Reconcile] Firestore write error for ${pid}:`, writeErr.message);
+            writeStatus = writeErr.message.includes('RESOURCE_EXHAUSTED') ? 'quota_exceeded' : 'write_failed';
+            errors++;
+          }
+          results.push({ ...subRecord, status: writeStatus });
         } catch (itemErr) {
           console.error(`[Reconcile] Error processing payment ${pid}:`, itemErr.message);
           errors++;
@@ -1390,8 +1397,9 @@ app.post('/api/admin-reconcile', async (req, res) => {
       }));
     }
 
-    console.log(`[Admin Reconcile] Done: ${synced} synced, ${skipped} skipped, ${errors} errors out of ${total} total`);
-    return res.status(200).json({ success: true, synced, skipped, errors, total, results });
+    const quotaExceeded = results.some(r => r.status === 'quota_exceeded');
+    console.log(`[Admin Reconcile] Done: ${synced} synced, ${skipped} skipped, ${errors} errors out of ${total} total (quotaExceeded: ${quotaExceeded})`);
+    return res.status(200).json({ success: true, synced, skipped, errors, total, quotaExceeded, results });
   } catch (err) {
     const errMsg = err.error?.description || err.message || String(err);
     console.error('[Admin Reconcile] Fatal error:', errMsg);
