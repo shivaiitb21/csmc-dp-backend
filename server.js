@@ -39,7 +39,8 @@ try {
         process.env.GOOGLE_APPLICATION_CREDENTIALS,
         '/etc/secrets/serviceAccount.json',
         '/etc/secrets/FIREBASE_SERVICE_ACCOUNT',
-        path.join(__dirname, 'serviceAccount.json')
+        path.join(__dirname, 'serviceAccount.json'),
+        path.join(__dirname, '..', 'serviceAccount.json')
       ].filter(Boolean);
 
       for (const p of candidatePaths) {
@@ -91,59 +92,11 @@ app.set('trust proxy', 1);
 // 1. HARDENED SECURITY HEADERS (Helmet & CSP)
 // -----------------------------------------------------------------------------
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: [
-        "'self'",
-        "'unsafe-inline'",
-        "'unsafe-eval'",
-        "https://cdn.tailwindcss.com",
-        "https://unpkg.com",
-        "https://checkout.razorpay.com",
-        "https://pagead2.googlesyndication.com",
-        "https://www.gstatic.com",
-        "https://*.firebaseio.com"
-      ],
-      styleSrc: [
-        "'self'",
-        "'unsafe-inline'",
-        "https://fonts.googleapis.com",
-        "https://unpkg.com"
-      ],
-      fontSrc: [
-        "'self'",
-        "https://fonts.gstatic.com",
-        "data:"
-      ],
-      imgSrc: [
-        "'self'",
-        "data:",
-        "blob:",
-        "https:",
-        "*.openstreetmap.org",
-        "*.tile.openstreetmap.org"
-      ],
-      connectSrc: [
-        "'self'",
-        "https://*.firebaseio.com",
-        "https://*.googleapis.com",
-        "https://api.razorpay.com",
-        "https://lumberjack.razorpay.com",
-        "https://pagead2.googlesyndication.com"
-      ],
-      frameSrc: [
-        "'self'",
-        "https://api.razorpay.com",
-        "https://googleads.g.doubleclick.net",
-        "https://pagead2.googlesyndication.com"
-      ],
-      objectSrc: ["'none'"],
-      upgradeInsecureRequests: []
-    }
-  },
+  contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" }
+  crossOriginOpenerPolicy: false,
+  crossOriginResourcePolicy: false,
+  hsts: false
 }));
 
 // -----------------------------------------------------------------------------
@@ -249,10 +202,16 @@ app.use((req, res, next) => {
 });
 
 // Serve frontend assets with safe static config
-app.use(express.static(path.join(__dirname, '..'), {
+const staticRoot = fs.existsSync(path.join(__dirname, 'index.html')) ? __dirname : path.join(__dirname, '..');
+app.use(express.static(staticRoot, {
   dotfiles: 'ignore',
-  index: false,
-  maxAge: '1h'
+  index: 'index.html',
+  maxAge: 0,
+  setHeaders: (res, path) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
 }));
 
 // -----------------------------------------------------------------------------
@@ -452,7 +411,7 @@ const DEFAULT_PRICING_CONFIG = {
     price: 9,
     durationDays: 7,
     badge: "Special 3-day offer",
-    daysRemaining: 3
+    daysRemaining: 1
   },
   tiers: {
     basic: {
@@ -544,17 +503,17 @@ async function resolveAuthoritativePlan(planId, cadenceId) {
   }
 
   let cadence = '30_days';
-  if (cadenceId) {
+  if (planId && (planId.includes('1d') || planId.includes('7d') || planId.includes('1m') || planId.includes('30d') || planId.includes('1y') || planId.includes('365d') || planId.includes('annual'))) {
+    if (planId.includes('1d')) cadence = '1_day';
+    else if (planId.includes('7d')) cadence = '7_days';
+    else if (planId.includes('1m') || planId.includes('30d')) cadence = '30_days';
+    else if (planId.includes('1y') || planId.includes('365d') || planId.includes('annual')) cadence = '365_days';
+  } else if (cadenceId) {
     if (cadenceId === '1d') cadence = '1_day';
     else if (cadenceId === '7d') cadence = '7_days';
     else if (cadenceId === '1m') cadence = '30_days';
     else if (cadenceId === '1y') cadence = '365_days';
     else cadence = cadenceId;
-  } else if (planId) {
-    if (planId.includes('1d')) cadence = '1_day';
-    else if (planId.includes('7d')) cadence = '7_days';
-    else if (planId.includes('1m') || planId.includes('30d')) cadence = '30_days';
-    else if (planId.includes('1y') || planId.includes('365d') || planId.includes('annual')) cadence = '365_days';
   }
 
   const tierPrices = (cfg.tiers && cfg.tiers[tier] && cfg.tiers[tier].prices) || DEFAULT_PRICING_CONFIG.tiers[tier].prices;
@@ -745,7 +704,7 @@ app.get('/api/razorpay-key', (req, res) => {
 
 // Active Subscription Plans Schema
 app.get('/api/subscription-plans', (req, res) => {
-  const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-07T23:59:59+05:30').getTime();
+  const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-06T12:31:00+05:30').getTime();
   const isLaunchActive = Date.now() <= LAUNCH_OFFER_END_TIMESTAMP;
   const plansCopy = JSON.parse(JSON.stringify(SUBSCRIPTION_PLANS));
   if (!isLaunchActive && plansCopy['launch_7d']) {
@@ -807,7 +766,7 @@ const handleCreateOrder = async (req, res) => {
     const sanitizedName = String(userName || 'Citizen User').slice(0, 80);
     const sanitizedCat = String(userCategory || 'Individual Citizen').slice(0, 80);
 
-    // Strict Single-Use Trial Pass Enforcement
+    // Strict Single-Use Trial Pass Enforcement (Verified strictly BEFORE checkout opens)
     if (plan.id === 'launch_7d') {
       if (!sanitizedPhone || sanitizedPhone.length !== 10 || !/^[6-9]\d{9}$/.test(sanitizedPhone)) {
         return res.status(400).json({
@@ -818,6 +777,19 @@ const handleCreateOrder = async (req, res) => {
         return res.status(400).json({
           error: "This mobile number has already redeemed the introductory trial pass. Please choose a standard pass."
         });
+      }
+      if (adminDb) {
+        try {
+          const userSubDoc = await adminDb.collection('users_subscriptions').doc(sanitizedPhone).get();
+          if (userSubDoc.exists && userSubDoc.data().hasUsedLaunchOffer) {
+            CLAIMED_TRIAL_PHONES.add(sanitizedPhone);
+            return res.status(400).json({
+              error: "This mobile number has already redeemed the introductory trial pass. Please choose a standard pass."
+            });
+          }
+        } catch (chkErr) {
+          console.warn('[Firestore] Notice checking trial phone in create-order:', chkErr.message);
+        }
       }
     }
 
@@ -887,15 +859,7 @@ app.post('/api/verify-payment', async (req, res) => {
     const paymentId = String(razorpay_payment_id).trim();
     const signature = String(razorpay_signature).trim();
 
-    // 1. Anti-Replay Check (Idempotency)
-    if (PROCESSED_PAYMENTS.has(paymentId)) {
-      return res.status(409).json({
-        success: false,
-        error: "Payment already processed. Duplicate redemption rejected."
-      });
-    }
-
-    // 2. Cryptographic HMAC-SHA256 Signature Verification (Constant-Time)
+    // 1. Cryptographic HMAC-SHA256 Signature Verification (Constant-Time)
     const expectedSignature = crypto
       .createHmac('sha256', key_secret)
       .update(`${orderId}|${paymentId}`)
@@ -909,8 +873,60 @@ app.post('/api/verify-payment', async (req, res) => {
       });
     }
 
+    // 2. Anti-Replay / Idempotent Fulfillment:
+    // If payment was already verified or processed (e.g. by webhook or client retry), return existing active subscription with 200 OK.
+    // Never reject captured funds with 409 "duplicate payment rejected".
+    if (VERIFIED_SUBSCRIPTIONS.has(paymentId)) {
+      const existing = VERIFIED_SUBSCRIPTIONS.get(paymentId);
+      return res.status(200).json({
+        success: true,
+        message: "Payment already verified and provisioned.",
+        order_id: existing.orderId || orderId,
+        payment_id: paymentId,
+        planId: existing.planId,
+        planName: existing.planName,
+        scope: existing.scope,
+        tier: existing.tier,
+        role: existing.role,
+        isPro: existing.isPro,
+        isBasic: existing.isBasic,
+        proToolsEnabled: existing.proToolsEnabled,
+        purchaseTimestamp: existing.purchaseTimestamp,
+        expiryTimestamp: existing.expiryTimestamp,
+        expiryDate: existing.expiryDate
+      });
+    }
+
+    if (PROCESSED_PAYMENTS.has(paymentId) && adminDb) {
+      try {
+        const subDoc = await adminDb.collection('subscriptions').doc(paymentId).get();
+        if (subDoc.exists && subDoc.data().isProvisioned) {
+          const data = subDoc.data();
+          return res.status(200).json({
+            success: true,
+            message: "Payment already verified and provisioned.",
+            order_id: data.orderId || orderId,
+            payment_id: paymentId,
+            planId: data.planId,
+            planName: data.planName,
+            scope: data.scope,
+            tier: data.tier,
+            role: data.role,
+            isPro: data.isPro,
+            isBasic: data.isBasic,
+            proToolsEnabled: data.proToolsEnabled,
+            purchaseTimestamp: data.purchaseTimestamp,
+            expiryTimestamp: data.expiryTimestamp,
+            expiryDate: data.expiryDate
+          });
+        }
+      } catch (dbErr) {
+        console.warn('[Firestore] Notice during idempotency lookup:', dbErr.message);
+      }
+    }
+
     // 3. Server-Side Privilege Escalation Defense:
-    // Fetch the canonical order directly from Razorpay to verify the actual purchased plan & amount
+    // Fetch canonical order directly from Razorpay to verify actual purchased plan & amount
     let verifiedPlanId = 'basic_1m';
     try {
       const orderData = await razorpay.orders.fetch(orderId);
@@ -926,23 +942,59 @@ app.post('/api/verify-payment', async (req, res) => {
 
     const plan = SUBSCRIPTION_PLANS[verifiedPlanId] || SUBSCRIPTION_PLANS['basic_1m'];
     const now = Date.now();
-    let expiryTimestamp;
+    const durationMs = (plan.durationHours === 24)
+      ? (24 * 60 * 60 * 1000)
+      : ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
 
-    if (plan.durationHours === 24) {
-      expiryTimestamp = now + (24 * 60 * 60 * 1000);
-    } else {
-      expiryTimestamp = now + (plan.durationDays * 24 * 60 * 60 * 1000);
+    const userEmail = String(req.body.userEmail || '').trim().toLowerCase();
+    const userPhone = normalizeIndianPhone(req.body.userPhone);
+    const userName = String(req.body.userName || '').trim().slice(0, 80) || (userEmail ? userEmail.split('@')[0] : 'Pass Holder');
+
+    // 4. Repeat Purchase Pass Extension:
+    // Check if the user already has an active valid pass that should be extended
+    let expiryTimestamp = now + durationMs;
+    let activeExisting = null;
+    for (const sub of VERIFIED_SUBSCRIPTIONS.values()) {
+      const matchPhone = userPhone && sub.phone === userPhone;
+      const matchEmail = userEmail && sub.email === userEmail;
+      if ((matchPhone || matchEmail) && sub.expiryTimestamp && sub.expiryTimestamp > now) {
+        if (!activeExisting || sub.expiryTimestamp > activeExisting.expiryTimestamp) {
+          activeExisting = sub;
+        }
+      }
+    }
+
+    if (activeExisting && activeExisting.expiryTimestamp > now) {
+      expiryTimestamp = activeExisting.expiryTimestamp + durationMs;
+      console.log(`[PASS EXTENSION] Extending active pass for ${userPhone || userEmail} from ${new Date(activeExisting.expiryTimestamp).toISOString()} to ${new Date(expiryTimestamp).toISOString()}`);
+    } else if (adminDb && (userPhone || userEmail)) {
+      try {
+        let existingDoc = null;
+        if (userPhone) {
+          const pDoc = await adminDb.collection('users_subscriptions').doc(userPhone).get();
+          if (pDoc.exists) existingDoc = pDoc.data();
+        }
+        if (!existingDoc && userEmail) {
+          const snap = await adminDb.collection('subscriptions')
+            .where('email', '==', userEmail)
+            .orderBy('expiryTimestamp', 'desc')
+            .limit(1)
+            .get();
+          if (!snap.empty) existingDoc = snap.docs[0].data();
+        }
+        if (existingDoc && existingDoc.expiryTimestamp && Number(existingDoc.expiryTimestamp) > now) {
+          expiryTimestamp = Number(existingDoc.expiryTimestamp) + durationMs;
+          console.log(`[PASS EXTENSION] Firestore-backed extension for ${userPhone || userEmail} to ${new Date(expiryTimestamp).toISOString()}`);
+        }
+      } catch (checkErr) {
+        console.warn('[Firestore] Notice during pass extension lookup:', checkErr.message);
+      }
     }
 
     // Mark payment as consumed in idempotency ledger
     PROCESSED_PAYMENTS.set(paymentId, now);
 
-    // Cache verified subscription record in memory
-    const userEmail = String(req.body.userEmail || '').trim().toLowerCase();
-    const userPhone = normalizeIndianPhone(req.body.userPhone);
-    const userName = String(req.body.userName || '').trim().slice(0, 80) || (userEmail ? userEmail.split('@')[0] : 'Pass Holder');
-
-    // Atomic Single-Use Trial Phone Enforcement
+    // Atomic Single-Use Trial Phone Enforcement (recorded upon captured payment)
     if (plan.id === 'launch_7d' && userPhone) {
       CLAIMED_TRIAL_PHONES.add(userPhone);
     }
@@ -1115,6 +1167,8 @@ app.post('/api/razorpay-webhook', (req, res) => {
         writeSubscriptionToFirestore(wRecord, pid, phone, email).catch(e =>
           console.warn('[Webhook Firestore] Write error:', e.message)
         );
+
+        VERIFIED_SUBSCRIPTIONS.set(pid, wRecord);
       }
       console.log(`[AUDIT] Webhook confirmed payment ${pid}, Plan: ${notes.planId}`);
     }
@@ -1911,8 +1965,12 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Root endpoint: API Status & Directory
+// Root endpoint: Serve Portal UI for browser or API Status for API calls
 app.get('/', (req, res) => {
+  const indexPath = path.join(staticRoot, 'index.html');
+  if (req.accepts('html') && fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
   res.json({
     status: "online",
     service: "CSMC DP Spatial Portal Payment API",
