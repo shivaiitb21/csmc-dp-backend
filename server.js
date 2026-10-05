@@ -624,7 +624,7 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
           const oldData = existingDoc.data() || {};
           const now = Date.now();
 
-          const isNewPro = Boolean(subRecord.isPro || subRecord.scope === 'pro');
+          const isNewPro = Boolean(subRecord.isPro || subRecord.scope === 'pro' || subRecord.role === 'pro');
           const oldProExp = oldData.proExpiryTimestamp || (oldData.isPro && oldData.expiryTimestamp ? Number(oldData.expiryTimestamp) : 0);
           const oldBasicExp = oldData.basicExpiryTimestamp || (!oldData.isPro && oldData.expiryTimestamp ? Number(oldData.expiryTimestamp) : 0);
 
@@ -644,11 +644,27 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
           const hasActivePro = Boolean(newProExp && newProExp > now);
           const hasActiveBasic = Boolean(newBasicExp && newBasicExp > now);
 
+          // If user has active Pro, NEVER downgrade planId or role to basic!
+          const chosenPlanId = hasActivePro
+            ? (isNewPro ? subRecord.planId : (oldData.isPro && oldData.planId ? oldData.planId : 'pro_1m'))
+            : (hasActiveBasic ? (subRecord.planId || oldData.planId || 'basic_1m') : subRecord.planId);
+
+          const chosenPlanName = hasActivePro
+            ? (isNewPro ? subRecord.planName : (oldData.isPro && oldData.planName ? oldData.planName : 'Monthly Pro Pass'))
+            : subRecord.planName;
+
+          const chosenPaymentId = (isNewPro || (subRecord.purchaseTimestamp >= (oldData.purchaseTimestamp || 0)))
+            ? subRecord.paymentId
+            : (oldData.paymentId || subRecord.paymentId);
+
           mergedProfile = {
             ...oldData,
             ...recordWithTs,
             paidAmount: totalPaid,
             price: totalPaid,
+            paymentId: chosenPaymentId,
+            planId: chosenPlanId,
+            planName: (hasActivePro && hasActiveBasic) ? `${chosenPlanName} (+ Active Basic)` : chosenPlanName,
             proExpiryDate: newProExp ? new Date(newProExp).toISOString() : (oldData.proExpiryDate || null),
             proExpiryTimestamp: newProExp || null,
             basicExpiryDate: newBasicExp ? new Date(newBasicExp).toISOString() : (oldData.basicExpiryDate || null),
@@ -659,8 +675,8 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
             isPro: hasActivePro,
             proToolsEnabled: hasActivePro,
             role: hasActivePro ? 'pro' : (hasActiveBasic ? 'basic' : 'free'),
-            scope: hasActivePro ? 'pro' : (hasActiveBasic ? 'basic' : 'basic'),
-            planName: (hasActivePro && hasActiveBasic) ? `${subRecord.planName} (+ Active Basic)` : subRecord.planName
+            tier: hasActivePro ? 'pro' : (hasActiveBasic ? 'basic' : 'free'),
+            scope: hasActivePro ? 'pro' : (hasActiveBasic ? 'basic' : 'basic')
           };
         }
       } catch (mergeErr) {
@@ -670,18 +686,34 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
       batch.set(adminDb.collection('users_subscriptions').doc(targetDocId), mergedProfile, { merge: true });
     }
 
-    // 3. Authoritatively sync entitlements to users/{userId} (if uid provided)
-    const uId = subRecord.userId || subRecord.uid;
+    // 3. Authoritatively sync entitlements to users collection
+    let uId = subRecord.userId || subRecord.uid;
+    // Auto-discover uId from users collection by phone or email if not explicitly provided
+    if (!uId) {
+      try {
+        if (phone && phone.length === 10) {
+          const uSnap = await adminDb.collection('users').where('phone', '==', phone).limit(1).get();
+          if (!uSnap.empty) uId = uSnap.docs[0].id;
+        }
+        if (!uId && email) {
+          const uSnapEmail = await adminDb.collection('users').where('email', '==', email.toLowerCase().trim()).limit(1).get();
+          if (!uSnapEmail.empty) uId = uSnapEmail.docs[0].id;
+        }
+      } catch (findErr) {
+        console.warn('[Firestore] Notice finding user by phone/email:', findErr.message);
+      }
+    }
+
     if (uId) {
       batch.set(adminDb.collection('users').doc(uId), {
-        role: subRecord.role || 'basic',
+        role: subRecord.role || (subRecord.isPro ? 'pro' : 'basic'),
         isPro: Boolean(subRecord.isPro),
-        tier: subRecord.tier || 'basic',
+        tier: subRecord.tier || (subRecord.isPro ? 'pro' : 'basic'),
         isSubscribed: true,
         proToolsEnabled: Boolean(subRecord.proToolsEnabled),
         planId: subRecord.planId,
         planName: subRecord.planName,
-        planExpiry: subRecord.planExpiry,
+        planExpiry: subRecord.planExpiry || subRecord.expiryDate,
         expiryTimestamp: subRecord.expiryTimestamp,
         expiryDate: subRecord.expiryDate,
         paymentId: subRecord.paymentId,
@@ -691,9 +723,10 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
     }
 
     await batch.commit();
-    console.log(`[Firestore] Subscription provisioned — payment: ${paymentId}, phone: ${phone || '(none)'}, email: ${email || '(none)'}`);
+    console.log(`[Firestore] Subscription provisioned — payment: ${paymentId}, phone: ${phone || '(none)'}, email: ${email || '(none)'}, uid: ${uId || '(auto-synced)'}`);
   } catch (err) {
     console.error('[Firestore] Batch write failed:', err.message);
+    throw err;
   }
 }
 
@@ -969,10 +1002,11 @@ app.post('/api/verify-payment', async (req, res) => {
       hasUsedLaunchOffer: (plan.id === 'launch_7d')
     };
 
-    // Fire-and-forget (don't await — response already sent)
-    writeSubscriptionToFirestore(fsRecord, paymentId, userPhone, userEmail).catch(e =>
-      console.warn('[Firestore] Background write error:', e.message)
-    );
+    try {
+      await writeSubscriptionToFirestore(fsRecord, paymentId, userPhone, userEmail);
+    } catch (fsErr) {
+      console.warn('[Firestore] Sync warning during verify-payment:', fsErr.message);
+    }
 
     res.status(200).json({
       success: true,
@@ -1292,6 +1326,40 @@ async function handleSubscriptionLookup(req, res) {
     // Pick active candidate if exists, else latest
     const activeCandidate = candidates.find(c => !c.isExpired);
     if (activeCandidate) {
+      // Automatic Self-Healing: Persist active subscription to Firestore so real-time listeners update
+      try {
+        const isPro = Boolean(activeCandidate.plan.proTools || activeCandidate.plan.scope === 'pro');
+        const autoSubRecord = {
+          isSubscribed: true,
+          isProvisioned: true,
+          role: isPro ? 'pro' : 'basic',
+          tier: isPro ? 'pro' : 'basic',
+          scope: activeCandidate.plan.scope || (isPro ? 'pro' : 'basic'),
+          isPro: isPro,
+          isBasic: !isPro,
+          proToolsEnabled: isPro,
+          planId: activeCandidate.plan.id,
+          planName: activeCandidate.plan.name,
+          price: activeCandidate.plan.price,
+          paidAmount: activeCandidate.plan.price,
+          planExpiry: new Date(activeCandidate.expiryTimestamp).toISOString(),
+          purchaseTimestamp: activeCandidate.purchaseTimestamp,
+          purchaseDate: new Date(activeCandidate.purchaseTimestamp).toISOString(),
+          expiryTimestamp: activeCandidate.expiryTimestamp,
+          expiryDate: new Date(activeCandidate.expiryTimestamp).toISOString(),
+          paymentId: activeCandidate.paymentId,
+          orderId: activeCandidate.orderId,
+          email: activeCandidate.email,
+          phone: activeCandidate.phone,
+          name: activeCandidate.name,
+          hasUsedLaunchOffer: (activeCandidate.plan.id === 'launch_7d'),
+          reconcileSource: 'lookup-subscription-self-heal'
+        };
+        await writeSubscriptionToFirestore(autoSubRecord, activeCandidate.paymentId, activeCandidate.phone, activeCandidate.email);
+      } catch (healErr) {
+        console.warn('[Lookup] Auto-healing Firestore write notice:', healErr.message);
+      }
+
       return res.status(200).json({
         success: true,
         found: true,
@@ -1432,83 +1500,81 @@ app.post('/api/admin-reconcile', verifyAdminAuth, async (req, res) => {
     }
 
     const validPayments = payments.filter(p => p.status === 'captured' || p.status === 'authorized');
+    // Sort chronologically ascending (oldest first) so newer plans stack and override older ones
+    validPayments.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
     total = validPayments.length;
 
-    // Process in batches of 10 concurrent requests to prevent timeout
-    const BATCH_SIZE = 10;
-    for (let i = 0; i < validPayments.length; i += BATCH_SIZE) {
-      const chunk = validPayments.slice(i, i + BATCH_SIZE);
-      await Promise.all(chunk.map(async (p) => {
-        const pid = p.id;
-        const notes = p.notes || {};
-        const phone = normalizeIndianPhone(notes.userPhone || notes.phone || p.contact);
-        const email = String(notes.userEmail || notes.email || p.email || '').toLowerCase().trim();
-        const name = String(notes.userName || notes.name || (email ? email.split('@')[0] : 'Citizen User')).slice(0, 80);
-        const category = String(notes.userCategory || notes.category || 'Individual Citizen / Land Buyer').slice(0, 80);
+    // Process sequentially to completely eliminate race conditions across multiple payments by the same user
+    for (const p of validPayments) {
+      const pid = p.id;
+      const notes = p.notes || {};
+      const phone = normalizeIndianPhone(notes.userPhone || notes.phone || p.contact);
+      const email = String(notes.userEmail || notes.email || p.email || '').toLowerCase().trim();
+      const name = String(notes.userName || notes.name || (email ? email.split('@')[0] : 'Citizen User')).slice(0, 80);
+      const category = String(notes.userCategory || notes.category || 'Individual Citizen / Land Buyer').slice(0, 80);
 
-        const planId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : inferPlanFromPayment(p)?.id || 'basic_1m';
-        const plan = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS['basic_1m'];
+      const planId = (notes.planId && SUBSCRIPTION_PLANS[notes.planId]) ? notes.planId : inferPlanFromPayment(p)?.id || 'basic_1m';
+      const plan = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS['basic_1m'];
 
-        const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
-        let expiryTimestamp;
-        if (plan.durationHours === 24) {
-          expiryTimestamp = purchaseMs + (24 * 60 * 60 * 1000);
-        } else {
-          expiryTimestamp = purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
+      const purchaseMs = (p.created_at || Math.floor(Date.now() / 1000)) * 1000;
+      let expiryTimestamp;
+      if (plan.durationHours === 24) {
+        expiryTimestamp = purchaseMs + (24 * 60 * 60 * 1000);
+      } else {
+        expiryTimestamp = purchaseMs + ((plan.durationDays || 30) * 24 * 60 * 60 * 1000);
+      }
+
+      const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
+      const amountRupees = Number(p.amount || 0) / 100;
+
+      const subRecord = {
+        isSubscribed: true,
+        isProvisioned: true,
+        role: isProTier ? 'pro' : 'basic',
+        tier: isProTier ? 'pro' : 'basic',
+        isPro: isProTier,
+        isBasic: !isProTier,
+        proToolsEnabled: Boolean(plan.proTools),
+        scope: plan.scope || 'basic',
+        planId,
+        planName: notes.planName || plan.name || planId,
+        price: amountRupees,
+        paidAmount: amountRupees,
+        planExpiry: new Date(expiryTimestamp).toISOString(),
+        purchaseTimestamp: purchaseMs,
+        purchaseDate: new Date(purchaseMs).toISOString(),
+        expiryTimestamp,
+        expiryDate: new Date(expiryTimestamp).toISOString(),
+        paymentId: pid,
+        orderId: p.order_id || '',
+        phone,
+        email,
+        name,
+        category,
+        hasUsedLaunchOffer: (planId === 'launch_7d'),
+        reconciledAt: new Date().toISOString(),
+        reconcileSource: 'admin-reconcile-endpoint'
+      };
+
+      // Attempt Firestore persistence (gracefully handles Spark tier quota limits)
+      let writeStatus = 'synced';
+      try {
+        const existingDoc = await adminDb.collection('subscriptions').doc(pid).get();
+        if (existingDoc.exists && existingDoc.data().isProvisioned) {
+          skipped++;
+          results.push({ ...subRecord, status: 'already_provisioned' });
+          continue;
         }
+        await writeSubscriptionToFirestore(subRecord, pid, phone, email);
+        synced++;
+      } catch (fsErr) {
+        const isQuota = (fsErr.message || '').includes('RESOURCE_EXHAUSTED') || (fsErr.code === 8);
+        writeStatus = isQuota ? 'quota_exceeded' : 'write_failed';
+        errors++;
+        console.warn(`[Reconcile] Firestore operation failed for ${pid}:`, fsErr.message);
+      }
 
-        const isProTier = Boolean(plan.proTools || plan.scope === 'pro');
-        const amountRupees = Number(p.amount || 0) / 100;
-
-        const subRecord = {
-          isSubscribed: true,
-          isProvisioned: true,
-          role: isProTier ? 'pro' : 'basic',
-          tier: isProTier ? 'pro' : 'basic',
-          isPro: isProTier,
-          isBasic: !isProTier,
-          proToolsEnabled: Boolean(plan.proTools),
-          scope: plan.scope || 'basic',
-          planId,
-          planName: notes.planName || plan.name || planId,
-          price: amountRupees,
-          paidAmount: amountRupees,
-          planExpiry: new Date(expiryTimestamp).toISOString(),
-          purchaseTimestamp: purchaseMs,
-          purchaseDate: new Date(purchaseMs).toISOString(),
-          expiryTimestamp,
-          expiryDate: new Date(expiryTimestamp).toISOString(),
-          paymentId: pid,
-          orderId: p.order_id || '',
-          phone,
-          email,
-          name,
-          category,
-          hasUsedLaunchOffer: (planId === 'launch_7d'),
-          reconciledAt: new Date().toISOString(),
-          reconcileSource: 'admin-reconcile-endpoint'
-        };
-
-        // Attempt Firestore persistence (gracefully handles Spark tier quota limits)
-        let writeStatus = 'synced';
-        try {
-          const existingDoc = await adminDb.collection('subscriptions').doc(pid).get();
-          if (existingDoc.exists && existingDoc.data().isProvisioned) {
-            skipped++;
-            results.push({ ...subRecord, status: 'already_provisioned' });
-            return;
-          }
-          await writeSubscriptionToFirestore(subRecord, pid, phone, email);
-          synced++;
-        } catch (fsErr) {
-          const isQuota = (fsErr.message || '').includes('RESOURCE_EXHAUSTED') || (fsErr.code === 8);
-          writeStatus = isQuota ? 'quota_exceeded' : 'write_failed';
-          errors++;
-          console.warn(`[Reconcile] Firestore operation failed for ${pid}:`, fsErr.message);
-        }
-
-        results.push({ ...subRecord, status: writeStatus });
-      }));
+      results.push({ ...subRecord, status: writeStatus });
     }
 
     const quotaExceeded = results.some(r => r.status === 'quota_exceeded');
@@ -1594,6 +1660,245 @@ app.post('/api/admin-pricing', verifyAdminAuth, async (req, res) => {
   }
 });
 
+
+// =============================================================================
+// ADMIN: GRANT MANUAL SUBSCRIPTION & CREATE FIREBASE AUTH USER
+// POST /api/admin-grant-pass
+// =============================================================================
+app.post('/api/admin-grant-pass', verifyAdminAuth, async (req, res) => {
+  const { email, password, phone, name, tier, duration, note, category } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  const cleanEmail = String(email).trim().toLowerCase();
+  const cleanPassword = String(password).trim();
+  const cleanPhone = phone ? String(phone).replace(/\D/g, '').slice(-10) : '';
+  const cleanName = name ? String(name).trim() : (cleanEmail.split('@')[0]);
+  const isPro = (tier === 'pro' || tier === 'Pro');
+  const durStr = String(duration || '30');
+
+  let expiryTimestamp = null;
+  let durationLabel = 'Lifetime';
+  if (durStr !== 'permanent') {
+    const days = parseInt(durStr, 10) || 30;
+    expiryTimestamp = Date.now() + (days * 24 * 60 * 60 * 1000);
+    durationLabel = days === 1 ? '24 Hours' : `${days} Days`;
+  }
+  const expiryDateStr = expiryTimestamp ? new Date(expiryTimestamp).toISOString() : null;
+  const planName = `Manual ${isPro ? 'Pro Pass' : 'Basic Pass'} (${durationLabel})`;
+
+  try {
+    const admin = require('firebase-admin');
+    let authUser = null;
+    let isNewUser = false;
+
+    if (admin.apps.length) {
+      try {
+        authUser = await admin.auth().getUserByEmail(cleanEmail);
+        authUser = await admin.auth().updateUser(authUser.uid, {
+          password: cleanPassword,
+          displayName: cleanName
+        });
+      } catch (authErr) {
+        if (authErr.code === 'auth/user-not-found') {
+          authUser = await admin.auth().createUser({
+            email: cleanEmail,
+            password: cleanPassword,
+            displayName: cleanName,
+            emailVerified: true
+          });
+          isNewUser = true;
+        } else {
+          throw authErr;
+        }
+      }
+    }
+
+    const targetUid = authUser ? authUser.uid : (cleanPhone ? `usr_${cleanPhone}` : `usr_${cleanEmail.replace(/[@.]/g, '_')}`);
+    const emailKey = cleanEmail.replace(/[@.]/g, '_');
+
+    const subRecord = {
+      uid: targetUid,
+      phone: cleanPhone,
+      email: cleanEmail,
+      name: cleanName,
+      category: category || 'Individual Citizen / Land Buyer',
+      planId: isPro ? `manual_pro_${durStr}` : `manual_basic_${durStr}`,
+      planName: planName,
+      scope: isPro ? 'pro' : 'basic',
+      proToolsEnabled: isPro,
+      isPro: isPro,
+      isBasic: !isPro,
+      price: 0,
+      paidAmount: 0,
+      durationLabel: durationLabel,
+      purchaseTimestamp: Date.now(),
+      purchaseDate: new Date().toISOString(),
+      expiryTimestamp: expiryTimestamp,
+      expiryDate: expiryDateStr,
+      hasUsedLaunchOffer: false,
+      razorpay_payment_id: `admin_grant_${Date.now().toString(36)}`,
+      razorpay_order_id: note ? `admin_ref_${note.replace(/\s+/g, '_')}` : `admin_manual_${durStr}`,
+      isSubscribed: true,
+      updatedAt: new Date().toISOString()
+    };
+
+    const userRecord = {
+      uid: targetUid,
+      phone: cleanPhone,
+      email: cleanEmail,
+      displayName: cleanName,
+      name: cleanName,
+      role: isPro ? 'pro' : 'basic',
+      isPro: isPro,
+      isBasic: !isPro,
+      proToolsEnabled: isPro,
+      planExpiry: expiryDateStr,
+      expiryTimestamp: expiryTimestamp,
+      expiryDate: expiryDateStr,
+      planId: subRecord.planId,
+      planName: subRecord.planName,
+      category: category || 'Individual Citizen / Land Buyer',
+      adminSetPassword: cleanPassword,
+      isSubscribed: true,
+      updatedAt: new Date().toISOString()
+    };
+
+    if (adminDb) {
+      const batch = adminDb.batch();
+      batch.set(adminDb.collection('users').doc(targetUid), userRecord, { merge: true });
+      if (cleanPhone) {
+        batch.set(adminDb.collection('users_subscriptions').doc(cleanPhone), subRecord, { merge: true });
+        if (targetUid !== `usr_${cleanPhone}`) {
+          batch.set(adminDb.collection('users').doc(`usr_${cleanPhone}`), userRecord, { merge: true });
+        }
+      }
+      batch.set(adminDb.collection('users_subscriptions').doc(emailKey), subRecord, { merge: true });
+      if (targetUid !== `usr_${emailKey}`) {
+        batch.set(adminDb.collection('users').doc(`usr_${emailKey}`), userRecord, { merge: true });
+      }
+      batch.set(adminDb.collection('user_credentials').doc(emailKey), {
+        email: cleanEmail,
+        password: cleanPassword,
+        uid: targetUid,
+        createdAt: new Date().toISOString(),
+        createdBy: 'admin_grant'
+      }, { merge: true });
+
+      await batch.commit();
+    }
+
+    return res.json({
+      success: true,
+      uid: targetUid,
+      isNew: isNewUser,
+      planName: planName,
+      message: isNewUser ? 'User created in Firebase Auth and granted subscription' : 'User password updated and subscription granted'
+    });
+  } catch (err) {
+    console.error('[Admin Grant Pass] Error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to grant pass' });
+  }
+});
+
+// =============================================================================
+// AUTH: RESOLVE MANUAL GRANT FOR LOGIN
+// POST /api/auth-resolve-grant
+// Creates Firebase Auth user if a matching admin grant exists in Firestore
+// =============================================================================
+app.post('/api/auth-resolve-grant', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ resolved: false, error: 'Email and password required' });
+  }
+
+  const cleanEmail = String(email).trim().toLowerCase();
+  const cleanPassword = String(password).trim();
+  const emailKey = cleanEmail.replace(/[@.]/g, '_');
+
+  if (!adminDb) {
+    return res.status(200).json({ resolved: false, message: 'Admin DB not available' });
+  }
+
+  try {
+    let matchedDoc = null;
+    let displayName = cleanEmail.split('@')[0];
+
+    // 1. Check user_credentials
+    const credSnap = await adminDb.collection('user_credentials').doc(emailKey).get();
+    if (credSnap.exists) {
+      const cd = credSnap.data();
+      if (cd.password === cleanPassword) {
+        matchedDoc = cd;
+      }
+    }
+
+    // 2. Check users/usr_${emailKey} if not matched yet
+    if (!matchedDoc) {
+      const uSnap = await adminDb.collection('users').doc(`usr_${emailKey}`).get();
+      if (uSnap.exists) {
+        const ud = uSnap.data();
+        if (ud.adminSetPassword === cleanPassword) {
+          matchedDoc = ud;
+          displayName = ud.displayName || ud.name || displayName;
+        }
+      }
+    }
+
+    // 3. Check users collection query by email
+    if (!matchedDoc) {
+      const qSnap = await adminDb.collection('users').where('email', '==', cleanEmail).limit(1).get();
+      if (!qSnap.empty) {
+        const ud = qSnap.docs[0].data();
+        if (ud.adminSetPassword === cleanPassword) {
+          matchedDoc = ud;
+          displayName = ud.displayName || ud.name || displayName;
+        }
+      }
+    }
+
+    if (!matchedDoc) {
+      return res.status(200).json({ resolved: false, message: 'No matching manual grant record found' });
+    }
+
+    const admin = require('firebase-admin');
+    let authUser = null;
+    try {
+      authUser = await admin.auth().getUserByEmail(cleanEmail);
+      authUser = await admin.auth().updateUser(authUser.uid, { password: cleanPassword });
+    } catch (getErr) {
+      if (getErr.code === 'auth/user-not-found') {
+        authUser = await admin.auth().createUser({
+          email: cleanEmail,
+          password: cleanPassword,
+          displayName: displayName,
+          emailVerified: true
+        });
+      } else {
+        throw getErr;
+      }
+    }
+
+    if (authUser && adminDb) {
+      await adminDb.collection('users').doc(authUser.uid).set({
+        ...matchedDoc,
+        uid: authUser.uid,
+        email: cleanEmail,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+    }
+
+    return res.status(200).json({
+      resolved: true,
+      uid: authUser.uid,
+      message: 'User credentials synchronized to Firebase Auth'
+    });
+  } catch (err) {
+    console.error('[Auth Resolve Grant] Error:', err);
+    return res.status(200).json({ resolved: false, error: err.message });
+  }
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {
