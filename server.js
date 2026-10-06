@@ -406,12 +406,12 @@ const SUBSCRIPTION_PLANS = {
 // =============================================================================
 const DEFAULT_PRICING_CONFIG = {
   trialOffer: {
-    enabled: true,
+    enabled: false,
     title: "7-Day Basic Access Trial Pass",
     price: 9,
     durationDays: 7,
-    badge: "Special 3-day offer",
-    daysRemaining: 1
+    badge: "Offer Ended",
+    daysRemaining: 0
   },
   tiers: {
     basic: {
@@ -704,17 +704,16 @@ app.get('/api/razorpay-key', (req, res) => {
 
 // Active Subscription Plans Schema
 app.get('/api/subscription-plans', (req, res) => {
-  const LAUNCH_OFFER_END_TIMESTAMP = new Date('2026-10-06T12:31:00+05:30').getTime();
-  const isLaunchActive = Date.now() <= LAUNCH_OFFER_END_TIMESTAMP;
+  const isLaunchActive = false;
   const plansCopy = JSON.parse(JSON.stringify(SUBSCRIPTION_PLANS));
-  if (!isLaunchActive && plansCopy['launch_7d']) {
+  if (plansCopy['launch_7d']) {
     plansCopy['launch_7d'].available = false;
     plansCopy['launch_7d'].expired = true;
   }
   res.json({
     success: true,
     plans: plansCopy,
-    launchOfferActive: isLaunchActive,
+    launchOfferActive: false,
     timestamp: new Date().toISOString()
   });
 });
@@ -746,10 +745,10 @@ const handleCreateOrder = async (req, res) => {
       }
     }
 
-    // Check if promotional trial offer is inactive in Firestore
-    if (plan.id === 'launch_7d' && plan.trialEnabled === false) {
+    // Reject purchase of promotional trial offer as it has ended
+    if (plan.id === 'launch_7d') {
       return res.status(400).json({
-        error: "The promotional trial offer is currently inactive. Please choose a standard pass."
+        error: "The 7-day basic access trial pass offer has ended. Please choose a standard pass."
       });
     }
 
