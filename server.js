@@ -598,7 +598,30 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
           }
 
           const maxExp = Math.max(newProExp || 0, newBasicExp || 0, Number(subRecord.expiryTimestamp || 0));
-          const totalPaid = Number(oldData.paidAmount || oldData.price || 0) + Number(subRecord.paidAmount || subRecord.price || 0);
+
+          // Idempotent revenue tracking: Extract existing recorded payments to prevent duplicate additions
+          let existingPayments = [];
+          if (Array.isArray(oldData.payments)) {
+            existingPayments = [...oldData.payments];
+          } else if (oldData.paymentId) {
+            existingPayments = String(oldData.paymentId).split(',').map(s => s.trim()).filter(Boolean);
+          }
+
+          const incomingPid = String(subRecord.paymentId || paymentId || '').trim();
+          const alreadyAccounted = Boolean(
+            incomingPid && (
+              existingPayments.includes(incomingPid) ||
+              (oldData.paymentId && String(oldData.paymentId).includes(incomingPid))
+            )
+          );
+
+          let totalPaid = Number(oldData.paidAmount !== undefined ? oldData.paidAmount : (oldData.price || 0));
+          if (!alreadyAccounted) {
+            totalPaid += Number(subRecord.paidAmount !== undefined ? subRecord.paidAmount : (subRecord.price || 0));
+            if (incomingPid) {
+              existingPayments.push(incomingPid);
+            }
+          }
 
           const hasActivePro = Boolean(newProExp && newProExp > now);
           const hasActiveBasic = Boolean(newBasicExp && newBasicExp > now);
@@ -621,6 +644,7 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
             ...recordWithTs,
             paidAmount: totalPaid,
             price: totalPaid,
+            payments: [...new Set(existingPayments.filter(Boolean))],
             paymentId: chosenPaymentId,
             planId: chosenPlanId,
             planName: (hasActivePro && hasActiveBasic) ? `${chosenPlanName} (+ Active Basic)` : chosenPlanName,
