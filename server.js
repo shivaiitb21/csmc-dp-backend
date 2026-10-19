@@ -133,7 +133,7 @@ app.use(cors({
     }
   },
   methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-razorpay-signature']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-razorpay-signature', 'x-admin-key']
 }));
 
 // -----------------------------------------------------------------------------
