@@ -110,9 +110,19 @@ app.use(helmet({
 // -----------------------------------------------------------------------------
 // 2. STRICT CORS WHITELISTING
 // -----------------------------------------------------------------------------
+const ALLOWED_ORIGIN_PATTERNS = [
+  /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/,
+  /^https:\/\/([a-z0-9-]+\.)?web\.app$/,
+  /^https:\/\/([a-z0-9-]+\.)?firebaseapp\.com$/,
+  /^https:\/\/([a-z0-9-]+\.)?sambhajinagardp\.in$/,
+  /^https:\/\/([a-z0-9-]+\.)?onrender\.com$/
+];
+
 const ALLOWED_ORIGINS = [
   'https://csmc-dp-portal.web.app',
   'https://csmc-dp-portal.firebaseapp.com',
+  'https://sambhajinagardp.in',
+  'https://www.sambhajinagardp.in',
   'http://localhost:3000',
   'http://127.0.0.1:3000'
 ];
@@ -123,13 +133,18 @@ if (process.env.ADDITIONAL_ALLOWED_ORIGINS) {
   });
 }
 
+function isOriginAllowed(origin) {
+  if (!origin || origin === 'null' || origin.startsWith('file://')) return true;
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  return ALLOWED_ORIGIN_PATTERNS.some(pat => pat.test(origin));
+}
+
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow non-browser requests (mobile, server-to-server webhooks)
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+    if (isOriginAllowed(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Cross-Origin Request Blocked by Security Policy'));
+      callback(new Error(`Cross-Origin Request from ${origin} Blocked by Security Policy`));
     }
   },
   methods: ['GET', 'POST'],
