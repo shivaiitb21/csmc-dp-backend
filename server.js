@@ -8,6 +8,14 @@ const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
+// Nodemailer for Admin Email Campaigns & Broadcasts
+let nodemailer = null;
+try {
+  nodemailer = require('nodemailer');
+} catch (e) {
+  console.warn('[Email] nodemailer module notice:', e.message);
+}
+
 // Firebase Admin SDK for authoritative Firestore writes
 let adminDb = null;
 try {
@@ -154,14 +162,15 @@ app.use('/api/create-razorpay-order', paymentApiLimiter);
 app.use('/api/verify-payment', paymentApiLimiter);
 
 // Body parsers with payload size caps to prevent memory exhaustion DoS
+// Limit set to 15mb to comfortably handle campaign email attachments & GIS geometries
 // Capture rawBody for deterministic cryptographic webhook verification
 app.use(express.json({
-  limit: '100kb',
+  limit: '15mb',
   verify: (req, res, buf) => {
     req.rawBody = buf;
   }
 }));
-app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 // -----------------------------------------------------------------------------
 // 4. ZERO-TRUST STATIC FILE SHIELD
@@ -1488,7 +1497,10 @@ app.get('/api/lookup-subscription', handleSubscriptionLookup);
 // Authorized administrator email whitelist
 const AUTHORIZED_ADMIN_EMAILS = [
   'admin@csmc.gov.in',
-  'shivdeveloper4@gmail.com'
+  'shivdeveloper4@gmail.com',
+  'admin@dataversesoftwaresystem.com',
+  'dataversesoftwaresystems@gmail.com',
+  'admin@sambhajinagardp.in'
 ];
 
 /**
@@ -1976,6 +1988,315 @@ app.post('/api/auth-resolve-grant', async (req, res) => {
     return res.status(200).json({ resolved: false, error: err.message });
   }
 });
+
+// =============================================================================
+// ADMIN: EMAIL CAMPAIGN & DIRECT MAIL BROADCAST ENGINE
+// POST /api/admin-send-email
+// Supports rich HTML emails, personalized tags, attachments, and safe dry-run simulation
+// =============================================================================
+app.post('/api/admin-send-email', verifyAdminAuth, async (req, res) => {
+  try {
+    const {
+      recipients, // Array of { email, name, phone, category, plan } OR array of strings
+      subject,
+      html,
+      text,
+      fromName = 'Sambhajinagar DP Portal',
+      fromEmail = (process.env.SMTP_FROM || 'admin@sambhajinagardp.in'),
+      replyTo = (process.env.SMTP_REPLY_TO || 'admin@sambhajinagardp.in'),
+      attachments = [], // Array of { filename, content (base64 string), contentType, encoding }
+      smtpConfig = null, // Optional custom { host, port, secure, user, pass, from, replyTo }
+      dryRun = false,
+      campaignName = 'User Feedback & Gratitude Broadcast',
+      bodyHtml
+    } = req.body || {};
+
+    const finalHtml = html || bodyHtml;
+
+    if (!subject || (!finalHtml && !text)) {
+      return res.status(400).json({ error: 'Subject and email body (HTML or text) are required.' });
+    }
+
+    // Standardize recipients list
+    let targetList = [];
+    if (Array.isArray(recipients)) {
+      targetList = recipients;
+    } else if (typeof recipients === 'string') {
+      targetList = recipients.split(/[,;\n]+/).map(e => ({ email: e.trim() })).filter(r => r.email);
+    }
+
+    // Filter valid email addresses
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const validRecipients = targetList
+      .map(r => typeof r === 'string' ? { email: r } : r)
+      .filter(r => r && r.email && emailRegex.test(String(r.email).trim().toLowerCase()))
+      .map(r => ({
+        ...r,
+        email: String(r.email).trim().toLowerCase(),
+        name: r.name ? String(r.name).trim() : (String(r.email).split('@')[0])
+      }));
+
+    if (validRecipients.length === 0) {
+      return res.status(400).json({ error: 'No valid recipient email addresses found in request.' });
+    }
+
+    // Format attachments for Nodemailer
+    const mailAttachments = (attachments || []).map(att => {
+      if (!att || !att.filename || !att.content) return null;
+      let content = att.content;
+      let encoding = att.encoding || 'base64';
+      if (typeof content === 'string' && content.includes('base64,')) {
+        content = content.split('base64,')[1];
+      }
+      return {
+        filename: att.filename,
+        content: content,
+        encoding: encoding,
+        contentType: att.contentType
+      };
+    }).filter(Boolean);
+
+    // Resolve effective SMTP configuration (Defaults to Gmail SMTP + Cloudflare Routing)
+    const effectiveHost = (smtpConfig && smtpConfig.host) || process.env.SMTP_HOST || 'smtp.gmail.com';
+    const effectivePort = Number((smtpConfig && smtpConfig.port) || process.env.SMTP_PORT || 465);
+    const effectiveUser = (smtpConfig && smtpConfig.user) || process.env.SMTP_USER || 'dataversesoftwaresystems@gmail.com';
+    const effectivePass = (smtpConfig && smtpConfig.pass) || process.env.SMTP_PASS;
+    const effectiveSecure = (smtpConfig && typeof smtpConfig.secure === 'boolean')
+      ? smtpConfig.secure
+      : (process.env.SMTP_SECURE === 'true' || effectivePort === 465);
+
+    // Sender & Reply-To addresses: displays domain email admin@sambhajinagardp.in
+    const effectiveFromEmail = (smtpConfig && smtpConfig.from) || fromEmail || process.env.SMTP_FROM || 'admin@sambhajinagardp.in';
+    const effectiveReplyTo = (smtpConfig && smtpConfig.replyTo) || replyTo || process.env.SMTP_REPLY_TO || 'admin@sambhajinagardp.in';
+
+    // Check simulation flag
+    const isSimulation = Boolean(dryRun || !effectivePass);
+
+    const results = {
+      success: true,
+      dryRun: isSimulation,
+      campaignName: campaignName,
+      totalRecipients: validRecipients.length,
+      sentCount: 0,
+      failedCount: 0,
+      timestamp: new Date().toISOString(),
+      logs: []
+    };
+
+    if (isSimulation) {
+      // Safe Local Simulation Mode
+      validRecipients.forEach((rcpt, idx) => {
+        results.sentCount++;
+        results.logs.push({
+          index: idx + 1,
+          to: rcpt.email,
+          name: rcpt.name,
+          status: 'simulated_delivered',
+          timestamp: new Date().toISOString(),
+          note: effectivePass ? 'Simulation Mode (Dry Run active)' : 'Simulation Mode (No SMTP password configured)'
+        });
+      });
+
+      // Save campaign log to Firestore if adminDb is active
+      if (adminDb) {
+        try {
+          await adminDb.collection('admin_email_campaigns').add({
+            campaignName,
+            subject,
+            sender: `${fromName} <${fromEmail}>`,
+            totalRecipients: validRecipients.length,
+            sentCount: results.sentCount,
+            failedCount: 0,
+            dryRun: true,
+            attachmentsCount: mailAttachments.length,
+            createdAt: new Date().toISOString()
+          });
+        } catch (e) {
+          console.warn('[Email Campaign] Firestore log note:', e.message);
+        }
+      }
+
+      return res.status(200).json(results);
+    }
+
+    // Live dispatch via Nodemailer
+    if (!nodemailer) {
+      return res.status(500).json({ error: 'Nodemailer library is not initialized on the server.' });
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: effectiveHost,
+      port: effectivePort,
+      secure: effectiveSecure,
+      auth: {
+        user: effectiveUser,
+        pass: effectivePass
+      },
+      tls: {
+        rejectUnauthorized: false
+      }
+    });
+
+    // Throttled sending loop
+    for (let i = 0; i < validRecipients.length; i++) {
+      const rcpt = validRecipients[i];
+      const personalizedSubject = subject.replace(/{{name}}/g, rcpt.name)
+                                         .replace(/{{email}}/g, rcpt.email)
+                                         .replace(/{{category}}/g, rcpt.category || 'Valued User')
+                                         .replace(/{{plan}}/g, rcpt.planName || rcpt.plan || 'DP Portal');
+      const personalizedHtml = (finalHtml || '')
+        .replace(/{{name}}/g, rcpt.name)
+        .replace(/{{email}}/g, rcpt.email)
+        .replace(/{{phone}}/g, rcpt.phone || '')
+        .replace(/{{category}}/g, rcpt.category || 'Valued User')
+        .replace(/{{plan}}/g, rcpt.planName || rcpt.plan || 'DP Portal');
+
+      const mailOptions = {
+        from: `"${fromName}" <${effectiveFromEmail}>`,
+        to: `"${rcpt.name}" <${rcpt.email}>`,
+        replyTo: effectiveReplyTo,
+        subject: personalizedSubject,
+        html: personalizedHtml,
+        text: text ? text.replace(/{{name}}/g, rcpt.name) : undefined,
+        attachments: mailAttachments
+      };
+
+      try {
+        const info = await transporter.sendMail(mailOptions);
+        results.sentCount++;
+        results.logs.push({
+          index: i + 1,
+          to: rcpt.email,
+          status: 'delivered',
+          messageId: info.messageId,
+          timestamp: new Date().toISOString()
+        });
+      } catch (sendErr) {
+        results.failedCount++;
+        results.logs.push({
+          index: i + 1,
+          to: rcpt.email,
+          status: 'failed',
+          error: sendErr.message,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      // Small throttle delay (75ms) between messages to prevent spam burst flags
+      if (i < validRecipients.length - 1) {
+        await new Promise(r => setTimeout(r, 75));
+      }
+    }
+
+    // Save campaign log to Firestore
+    if (adminDb) {
+      try {
+        await adminDb.collection('admin_email_campaigns').add({
+          campaignName,
+          subject,
+          sender: `${fromName} <${fromEmail}>`,
+          totalRecipients: validRecipients.length,
+          sentCount: results.sentCount,
+          failedCount: results.failedCount,
+          dryRun: false,
+          attachmentsCount: mailAttachments.length,
+          createdAt: new Date().toISOString()
+        });
+      } catch (e) { }
+    }
+
+    return res.status(200).json(results);
+  } catch (err) {
+    console.error('[Admin Send Email] Error:', err);
+    return res.status(500).json({ error: err.message || 'Internal server error dispatching email' });
+  }
+});
+
+// =============================================================================
+// ADMIN: TEST SMTP CONNECTION
+// POST /api/admin-test-smtp
+// =============================================================================
+app.post('/api/admin-test-smtp', verifyAdminAuth, async (req, res) => {
+  try {
+    const { smtpConfig, testRecipient } = req.body || {};
+    const effectiveHost = (smtpConfig && smtpConfig.host) || process.env.SMTP_HOST || 'smtp.gmail.com';
+    const effectivePort = Number((smtpConfig && smtpConfig.port) || process.env.SMTP_PORT || 465);
+    const effectiveUser = (smtpConfig && smtpConfig.user) || process.env.SMTP_USER || 'dataversesoftwaresystems@gmail.com';
+    const effectivePass = (smtpConfig && smtpConfig.pass) || process.env.SMTP_PASS;
+    const effectiveFrom = (smtpConfig && smtpConfig.from) || process.env.SMTP_FROM || 'admin@sambhajinagardp.in';
+    const effectiveSecure = (smtpConfig && typeof smtpConfig.secure === 'boolean')
+      ? smtpConfig.secure
+      : (process.env.SMTP_SECURE === 'true' || effectivePort === 465);
+
+    if (!effectiveHost || !effectivePass) {
+      return res.status(400).json({
+        error: 'SMTP Host and Password are required. Please configure them in the SMTP Settings dialog or environment variables.'
+      });
+    }
+
+    if (!nodemailer) {
+      return res.status(500).json({ error: 'Nodemailer library is not initialized on the server.' });
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: effectiveHost,
+      port: effectivePort,
+      secure: effectiveSecure,
+      auth: { user: effectiveUser, pass: effectivePass },
+      tls: { rejectUnauthorized: false }
+    });
+
+    await transporter.verify();
+
+    let testSent = false;
+    if (testRecipient && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(testRecipient)) {
+      await transporter.sendMail({
+        from: `"Sambhajinagar DP Portal" <${effectiveFrom}>`,
+        replyTo: effectiveFrom,
+        to: testRecipient,
+        subject: '✅ Sambhajinagar DP Portal: SMTP Connection Verified Successfully',
+        html: `
+          <div style="font-family:sans-serif; padding:24px; color:#1e293b; max-width:550px; border:1px solid #e2e8f0; border-radius:12px;">
+            <h2 style="color:#4f46e5; margin-top:0;">Sambhajinagar DP Portal – SMTP Verified</h2>
+            <p>Your mail server at <strong>${effectiveHost}:${effectivePort}</strong> with authenticated user <strong>${effectiveUser}</strong> and routed address <strong>${effectiveFrom}</strong> is communicating cleanly with the Sambhajinagar DP Portal backend.</p>
+            <p style="color:#16a34a; font-size:13px; font-weight:600;">✓ Gmail SMTP Authentication Successful<br>✓ Cloudflare Email Routing Active (${effectiveFrom} ➔ ${effectiveUser})</p>
+            <p style="color:#64748b; font-size:12px; margin-bottom:0;">Timestamp: ${new Date().toLocaleString('en-IN')}</p>
+          </div>
+        `
+      });
+      testSent = true;
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: testSent
+        ? `SMTP connection verified and test message sent to ${testRecipient}!`
+        : 'SMTP server handshake and credentials verified successfully!'
+    });
+  } catch (err) {
+    console.error('[Admin Test SMTP] Error:', err);
+    return res.status(400).json({ error: err.message || 'SMTP connection verification failed.' });
+  }
+});
+
+// =============================================================================
+// ADMIN: CAMPAIGN HISTORY
+// GET /api/admin-campaign-history
+// =============================================================================
+app.get('/api/admin-campaign-history', verifyAdminAuth, async (req, res) => {
+  try {
+    if (!adminDb) {
+      return res.status(200).json({ history: [] });
+    }
+    const snap = await adminDb.collection('admin_email_campaigns').orderBy('createdAt', 'desc').limit(20).get();
+    const history = [];
+    snap.forEach(doc => history.push({ id: doc.id, ...doc.data() }));
+    return res.status(200).json({ history });
+  } catch (err) {
+    return res.status(200).json({ history: [] });
+  }
+});
+
 
 // Health check endpoint
 app.get('/health', (req, res) => {
