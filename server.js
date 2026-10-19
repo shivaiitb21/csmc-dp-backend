@@ -2119,7 +2119,127 @@ app.post('/api/admin-send-email', verifyAdminAuth, async (req, res) => {
       return res.status(200).json(results);
     }
 
-    // Live dispatch via Nodemailer
+    // Check for HTTP Email API (Resend or Brevo via HTTPS port 443 - never blocked by cloud firewalls)
+    const isResend = (smtpConfig && smtpConfig.provider === 'resend') || (effectivePass && effectivePass.startsWith('re_'));
+    const isBrevo = (smtpConfig && smtpConfig.provider === 'brevo') || (effectiveHost && effectiveHost.toLowerCase().includes('brevo'));
+
+    if (isResend) {
+      for (let i = 0; i < validRecipients.length; i++) {
+        const rcpt = validRecipients[i];
+        const personalizedSubject = subject.replace(/{{name}}/g, rcpt.name)
+                                           .replace(/{{email}}/g, rcpt.email)
+                                           .replace(/{{category}}/g, rcpt.category || 'Valued User')
+                                           .replace(/{{plan}}/g, rcpt.planName || rcpt.plan || 'DP Portal');
+        const personalizedHtml = (finalHtml || '')
+          .replace(/{{name}}/g, rcpt.name)
+          .replace(/{{email}}/g, rcpt.email)
+          .replace(/{{phone}}/g, rcpt.phone || '')
+          .replace(/{{category}}/g, rcpt.category || 'Valued User')
+          .replace(/{{plan}}/g, rcpt.planName || rcpt.plan || 'DP Portal');
+
+        try {
+          const rRes = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${effectivePass}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              from: `${fromName} <${effectiveFromEmail}>`,
+              to: [rcpt.email],
+              reply_to: effectiveReplyTo,
+              subject: personalizedSubject,
+              html: personalizedHtml
+            })
+          });
+          const rData = await rRes.json();
+          if (!rRes.ok) throw new Error(rData.message || rData.error || 'Resend API error');
+          results.sentCount++;
+          results.logs.push({ index: i + 1, to: rcpt.email, status: 'delivered', messageId: rData.id, timestamp: new Date().toISOString() });
+        } catch (rErr) {
+          results.failedCount++;
+          results.logs.push({ index: i + 1, to: rcpt.email, status: 'failed', error: rErr.message, timestamp: new Date().toISOString() });
+        }
+        if (i < validRecipients.length - 1) await new Promise(r => setTimeout(r, 60));
+      }
+
+      if (adminDb) {
+        try {
+          await adminDb.collection('admin_email_campaigns').add({
+            campaignName,
+            subject,
+            sender: `${fromName} <${fromEmail}>`,
+            totalRecipients: validRecipients.length,
+            sentCount: results.sentCount,
+            failedCount: results.failedCount,
+            dryRun: false,
+            provider: 'resend',
+            createdAt: new Date().toISOString()
+          });
+        } catch (e) { }
+      }
+      return res.status(200).json(results);
+    }
+
+    if (isBrevo) {
+      for (let i = 0; i < validRecipients.length; i++) {
+        const rcpt = validRecipients[i];
+        const personalizedSubject = subject.replace(/{{name}}/g, rcpt.name)
+                                           .replace(/{{email}}/g, rcpt.email)
+                                           .replace(/{{category}}/g, rcpt.category || 'Valued User')
+                                           .replace(/{{plan}}/g, rcpt.planName || rcpt.plan || 'DP Portal');
+        const personalizedHtml = (finalHtml || '')
+          .replace(/{{name}}/g, rcpt.name)
+          .replace(/{{email}}/g, rcpt.email)
+          .replace(/{{phone}}/g, rcpt.phone || '')
+          .replace(/{{category}}/g, rcpt.category || 'Valued User')
+          .replace(/{{plan}}/g, rcpt.planName || rcpt.plan || 'DP Portal');
+
+        try {
+          const bRes = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: {
+              'api-key': effectivePass,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              sender: { name: fromName, email: effectiveFromEmail },
+              to: [{ email: rcpt.email, name: rcpt.name }],
+              replyTo: { email: effectiveReplyTo },
+              subject: personalizedSubject,
+              htmlContent: personalizedHtml
+            })
+          });
+          const bData = await bRes.json();
+          if (!bRes.ok) throw new Error(bData.message || 'Brevo API error');
+          results.sentCount++;
+          results.logs.push({ index: i + 1, to: rcpt.email, status: 'delivered', messageId: bData.messageId, timestamp: new Date().toISOString() });
+        } catch (bErr) {
+          results.failedCount++;
+          results.logs.push({ index: i + 1, to: rcpt.email, status: 'failed', error: bErr.message, timestamp: new Date().toISOString() });
+        }
+        if (i < validRecipients.length - 1) await new Promise(r => setTimeout(r, 60));
+      }
+
+      if (adminDb) {
+        try {
+          await adminDb.collection('admin_email_campaigns').add({
+            campaignName,
+            subject,
+            sender: `${fromName} <${fromEmail}>`,
+            totalRecipients: validRecipients.length,
+            sentCount: results.sentCount,
+            failedCount: results.failedCount,
+            dryRun: false,
+            provider: 'brevo',
+            createdAt: new Date().toISOString()
+          });
+        } catch (e) { }
+      }
+      return res.status(200).json(results);
+    }
+
+    // Live dispatch via Nodemailer (with strict 7s connection timeout)
     if (!nodemailer) {
       return res.status(500).json({ error: 'Nodemailer library is not initialized on the server.' });
     }
@@ -2134,8 +2254,22 @@ app.post('/api/admin-send-email', verifyAdminAuth, async (req, res) => {
       },
       tls: {
         rejectUnauthorized: false
-      }
+      },
+      connectionTimeout: 7000,
+      greetingTimeout: 5000,
+      socketTimeout: 8000
     });
+
+    // Fast pre-flight check so we never hang on blocked ports
+    try {
+      await transporter.verify();
+    } catch (verifyErr) {
+      let msg = verifyErr.message || 'SMTP Handshake failed';
+      if (verifyErr.code === 'ETIMEDOUT' || msg.includes('timeout') || msg.includes('ETIMEDOUT') || verifyErr.code === 'ESOCKETTIMEDOUT') {
+        msg = `SMTP connection to ${effectiveHost}:${effectivePort} timed out (7s). Cloud hosting free tiers (like Render Free) block outbound SMTP ports 465 & 587. Please select 'Local Relay (http://localhost:3000)' in settings or use an HTTPS Email API (Brevo/Resend).`;
+      }
+      return res.status(400).json({ error: msg });
+    }
 
     // Throttled sending loop
     for (let i = 0; i < validRecipients.length; i++) {
@@ -2234,6 +2368,46 @@ app.post('/api/admin-test-smtp', verifyAdminAuth, async (req, res) => {
       });
     }
 
+    // Check if testing Resend or Brevo API
+    const isResend = (smtpConfig && smtpConfig.provider === 'resend') || (effectivePass && effectivePass.startsWith('re_'));
+    const isBrevo = (smtpConfig && smtpConfig.provider === 'brevo') || (effectiveHost && effectiveHost.toLowerCase().includes('brevo'));
+
+    if (isResend) {
+      if (testRecipient && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(testRecipient)) {
+        const rRes = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${effectivePass}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            from: `Sambhajinagar DP Portal <${effectiveFrom}>`,
+            to: [testRecipient],
+            subject: '✅ Sambhajinagar DP Portal: Resend HTTPS Connection Verified',
+            html: '<p>Resend HTTPS API dispatch verified successfully over port 443!</p>'
+          })
+        });
+        const rData = await rRes.json();
+        if (!rRes.ok) throw new Error(rData.message || rData.error || 'Resend test failed');
+      }
+      return res.status(200).json({ success: true, message: 'Resend HTTPS API connection verified successfully!' });
+    }
+
+    if (isBrevo) {
+      if (testRecipient && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(testRecipient)) {
+        const bRes = await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: { 'api-key': effectivePass, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sender: { name: 'Sambhajinagar DP Portal', email: effectiveFrom },
+            to: [{ email: testRecipient }],
+            subject: '✅ Sambhajinagar DP Portal: Brevo HTTPS Connection Verified',
+            htmlContent: '<p>Brevo HTTPS API dispatch verified successfully over port 443!</p>'
+          })
+        });
+        const bData = await bRes.json();
+        if (!bRes.ok) throw new Error(bData.message || 'Brevo test failed');
+      }
+      return res.status(200).json({ success: true, message: 'Brevo HTTPS API connection verified successfully!' });
+    }
+
     if (!nodemailer) {
       return res.status(500).json({ error: 'Nodemailer library is not initialized on the server.' });
     }
@@ -2243,10 +2417,21 @@ app.post('/api/admin-test-smtp', verifyAdminAuth, async (req, res) => {
       port: effectivePort,
       secure: effectiveSecure,
       auth: { user: effectiveUser, pass: effectivePass },
-      tls: { rejectUnauthorized: false }
+      tls: { rejectUnauthorized: false },
+      connectionTimeout: 7000,
+      greetingTimeout: 5000,
+      socketTimeout: 8000
     });
 
-    await transporter.verify();
+    try {
+      await transporter.verify();
+    } catch (verifyErr) {
+      let msg = verifyErr.message || 'SMTP Handshake failed';
+      if (verifyErr.code === 'ETIMEDOUT' || msg.includes('timeout') || msg.includes('ETIMEDOUT') || verifyErr.code === 'ESOCKETTIMEDOUT') {
+        msg = `SMTP connection to ${effectiveHost}:${effectivePort} timed out (7s). Cloud hosting free tiers (like Render Free) block outbound SMTP ports 465 & 587. Please select 'Local Relay (http://localhost:3000)' in settings or use an HTTPS Email API (Brevo/Resend).`;
+      }
+      return res.status(400).json({ error: msg });
+    }
 
     let testSent = false;
     if (testRecipient && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(testRecipient)) {
