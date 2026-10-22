@@ -19,8 +19,15 @@ try {
 // Firebase Admin SDK for authoritative Firestore writes
 let adminDb = null;
 try {
-  const admin = require('firebase-admin');
-  if (!admin.apps.length) {
+  let admin = null;
+  try {
+    admin = require('firebase-admin');
+  } catch (e1) {
+    try {
+      admin = require(path.join(__dirname, 'node_modules', 'firebase-admin'));
+    } catch (e2) {}
+  }
+  if (admin && !admin.apps.length) {
     let serviceAccount = null;
 
     // 1. Try env variable FIREBASE_SERVICE_ACCOUNT (raw JSON or base64)
@@ -193,13 +200,16 @@ app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 // -----------------------------------------------------------------------------
 const FORBIDDEN_EXTENSIONS = [
   '.csv', '.env', '.rules', '.tif', '.tiff', '.aux.xml', '.kml', '.kmz',
-  '.md', '.bak', '.log', '.sh', '.yaml', '.yml'
+  '.md', '.bak', '.log', '.sh', '.yaml', '.yml',
+  '.cjs', '.mjs', '.py', '.sql'
 ];
 
 const FORBIDDEN_PATHS = [
   'rzp-key', 'server.js', 'package.json', 'package-lock.json',
   'backend', 'functions', 'google_earth', 'sector_calibration',
-  '.backups', '.git', '.firebase', 'node_modules'
+  '.backups', '.git', '.firebase', '.firebaserc', 'firebase.json',
+  'node_modules', 'scratch', 'generate-icons.js',
+  'csmc_dp_portal_monetization_30day_masterplan.pdf'
 ];
 
 app.use((req, res, next) => {
@@ -1534,9 +1544,16 @@ async function verifyAdminAuth(req, res, next) {
     const idToken = authHeader.split('Bearer ')[1].trim();
     if (idToken) {
       try {
-        const admin = require('firebase-admin');
-        if (admin.apps.length) {
-          const decoded = await admin.auth().verifyIdToken(idToken);
+        let fAdmin = null;
+        try {
+          fAdmin = require('firebase-admin');
+        } catch (e) {
+          try {
+            fAdmin = require(path.join(__dirname, 'node_modules', 'firebase-admin'));
+          } catch (e2) {}
+        }
+        if (fAdmin && fAdmin.apps.length) {
+          const decoded = await fAdmin.auth().verifyIdToken(idToken);
           if (decoded) {
             const email = (decoded.email || '').toLowerCase().trim();
             const isAdmin = decoded.admin === true || (decoded.email_verified && AUTHORIZED_ADMIN_EMAILS.includes(email));
@@ -1552,10 +1569,16 @@ async function verifyAdminAuth(req, res, next) {
     }
   }
 
-  // 2. Dual-mode fallback: Check adminKey in request body, header, or query for backward compatibility
+  // 2. Secret Key Fallback:
+  // When ADMIN_RECONCILE_KEY is configured in .env or Render, strictly enforce it.
+  // When unconfigured, allow default key for local offline development.
   const rawProvidedKey = req.body?.adminKey || req.headers['x-admin-key'] || req.query?.adminKey;
   const providedKey = String(rawProvidedKey || '').replace(/^["']|["']$/g, '').trim();
-  if (providedKey && (providedKey === defaultAdminKey || (envAdminKey && providedKey === envAdminKey))) {
+  const isKeyValid = envAdminKey
+    ? (providedKey === envAdminKey)
+    : (providedKey === defaultAdminKey);
+
+  if (providedKey && isKeyValid) {
     return next();
   }
 
