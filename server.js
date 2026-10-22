@@ -2005,6 +2005,60 @@ app.post('/api/auth-resolve-grant', async (req, res) => {
 });
 
 // =============================================================================
+// AUTH: CHECK USER EXISTENCE
+// POST /api/auth-check-user
+// Safe check to determine if an email is registered before sign-in
+// =============================================================================
+app.post('/api/auth-check-user', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) {
+    return res.status(400).json({ exists: false, error: 'Email required' });
+  }
+
+  const cleanEmail = String(email).trim().toLowerCase();
+  const emailKey = cleanEmail.replace(/[@.]/g, '_');
+
+  try {
+    let exists = false;
+
+    // 1. Check via Firebase Admin SDK if available
+    try {
+      const admin = require('firebase-admin');
+      if (admin.apps && admin.apps.length) {
+        const u = await admin.auth().getUserByEmail(cleanEmail);
+        if (u && u.uid) exists = true;
+      }
+    } catch (authErr) {
+      if (authErr.code !== 'auth/user-not-found') {
+        // Ignored
+      }
+    }
+
+    // 2. Check adminDb if available
+    if (!exists && adminDb) {
+      try {
+        const uDoc = await adminDb.collection('users').doc(`usr_${emailKey}`).get();
+        if (uDoc.exists) exists = true;
+
+        if (!exists) {
+          const credDoc = await adminDb.collection('user_credentials').doc(emailKey).get();
+          if (credDoc.exists) exists = true;
+        }
+
+        if (!exists) {
+          const qSnap = await adminDb.collection('users').where('email', '==', cleanEmail).limit(1).get();
+          if (!qSnap.empty) exists = true;
+        }
+      } catch (dbErr) { }
+    }
+
+    return res.status(200).json({ exists });
+  } catch (err) {
+    return res.status(200).json({ exists: false });
+  }
+});
+
+// =============================================================================
 // ADMIN: EMAIL CAMPAIGN & DIRECT MAIL BROADCAST ENGINE
 // POST /api/admin-send-email
 // Supports rich HTML emails, personalized tags, attachments, and safe dry-run simulation
@@ -2260,6 +2314,9 @@ app.post('/api/admin-send-email', verifyAdminAuth, async (req, res) => {
     }
 
     const transporter = nodemailer.createTransport({
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 100,
       host: effectiveHost,
       port: effectivePort,
       secure: effectiveSecure,
@@ -2270,9 +2327,9 @@ app.post('/api/admin-send-email', verifyAdminAuth, async (req, res) => {
       tls: {
         rejectUnauthorized: false
       },
-      connectionTimeout: 7000,
-      greetingTimeout: 5000,
-      socketTimeout: 8000
+      connectionTimeout: 12000,
+      greetingTimeout: 8000,
+      socketTimeout: 15000
     });
 
     // Fast pre-flight check so we never hang on blocked ports
@@ -2281,7 +2338,10 @@ app.post('/api/admin-send-email', verifyAdminAuth, async (req, res) => {
     } catch (verifyErr) {
       let msg = verifyErr.message || 'SMTP Handshake failed';
       if (verifyErr.code === 'ETIMEDOUT' || msg.includes('timeout') || msg.includes('ETIMEDOUT') || verifyErr.code === 'ESOCKETTIMEDOUT') {
-        msg = `SMTP connection to ${effectiveHost}:${effectivePort} timed out (7s). Cloud hosting free tiers (like Render Free) block outbound SMTP ports 465 & 587. Please select 'Local Relay (http://localhost:3000)' in settings or use an HTTPS Email API (Brevo/Resend).`;
+        msg = `SMTP connection to ${effectiveHost}:${effectivePort} timed out (12s). Cloud hosting free tiers (like Render Free) block outbound SMTP ports 465 & 587. Please select 'Local Relay (http://localhost:3000)' in settings or use an HTTPS Email API (Brevo/Resend).`;
+      }
+      if (transporter && typeof transporter.close === 'function') {
+        try { transporter.close(); } catch (e) { }
       }
       return res.status(400).json({ error: msg });
     }
@@ -2331,10 +2391,14 @@ app.post('/api/admin-send-email', verifyAdminAuth, async (req, res) => {
         });
       }
 
-      // Small throttle delay (75ms) between messages to prevent spam burst flags
+      // Small throttle delay (50ms) between messages to keep connection orderly
       if (i < validRecipients.length - 1) {
-        await new Promise(r => setTimeout(r, 75));
+        await new Promise(r => setTimeout(r, 50));
       }
+    }
+
+    if (transporter && typeof transporter.close === 'function') {
+      try { transporter.close(); } catch (e) { }
     }
 
     // Save campaign log to Firestore
