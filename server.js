@@ -308,7 +308,7 @@ const SUBSCRIPTION_PLANS = {
     proTools: false,
     singleUse: true,
     badge: '3-Day Special Offer',
-    description: 'Special 3-day introductory launch trial. Regular tariffs apply thereafter.'
+    description: 'Special 3-day introductory launch trial. Regular tariffs apply thereafter. (Note: Excluded Part (EP) Maps are NOT available in Basic Plan — available on PRO).'
   },
   'basic_1d': {
     id: 'basic_1d',
@@ -323,7 +323,7 @@ const SUBSCRIPTION_PLANS = {
     proTools: false,
     singleUse: false,
     badge: 'Quick View',
-    description: 'Basic map viewing valid strictly 24 hours from purchase'
+    description: 'Basic map viewing valid strictly 24 hours from purchase. (Note: Excluded Part (EP) Maps are NOT available in Basic Plan — available on PRO).'
   },
   'basic_7d': {
     id: 'basic_7d',
@@ -338,7 +338,7 @@ const SUBSCRIPTION_PLANS = {
     proTools: false,
     singleUse: false,
     badge: 'Weekly Pass',
-    description: 'Basic map viewing valid for 7 full days from purchase'
+    description: 'Basic map viewing valid for 7 full days from purchase. (Note: Excluded Part (EP) Maps are NOT available in Basic Plan — available on PRO).'
   },
   'basic_1m': {
     id: 'basic_1m',
@@ -353,7 +353,7 @@ const SUBSCRIPTION_PLANS = {
     proTools: false,
     singleUse: false,
     badge: 'Standard',
-    description: 'Unlimited HD DP Map view for 30 days'
+    description: 'Unlimited HD DP Map view for 30 days. (Note: Excluded Part (EP) Maps are NOT available in Basic Plan — available on PRO).'
   },
   'basic_1y': {
     id: 'basic_1y',
@@ -369,7 +369,7 @@ const SUBSCRIPTION_PLANS = {
     singleUse: false,
     badge: 'Best Value',
     savings: 'Save ~30% · ~₹208/mo',
-    description: 'Unlimited HD DP Map view for 1 full year'
+    description: 'Unlimited HD DP Map view for 1 full year. (Note: Excluded Part (EP) Maps are NOT available in Basic Plan — available on PRO).'
   },
   'pro_1d': {
     id: 'pro_1d',
@@ -384,7 +384,7 @@ const SUBSCRIPTION_PLANS = {
     proTools: true,
     singleUse: false,
     badge: 'Pro Day Pass',
-    description: 'Full GIS Pro measurement tools + DP view for strictly 24 hours'
+    description: 'Full GIS Pro access: Excluded Part (EP - वगळलेला भाग) modification map overlays, Road Distance, Polygon Area, GPS Coordinates & DP Maps for 24 hours.'
   },
   'pro_7d': {
     id: 'pro_7d',
@@ -399,7 +399,7 @@ const SUBSCRIPTION_PLANS = {
     proTools: true,
     singleUse: false,
     badge: 'Weekly Pro',
-    description: 'Full GIS Pro measurement tools + DP view for 7 days'
+    description: 'Full GIS Pro access: Excluded Part (EP - वगळलेला भाग) modification map overlays, Road Distance, Polygon Area, GPS Coordinates & DP Maps for 7 days.'
   },
   'pro_1m': {
     id: 'pro_1m',
@@ -415,7 +415,7 @@ const SUBSCRIPTION_PLANS = {
     singleUse: false,
     badge: 'Most Popular for Architects & Planners',
     savings: 'Best Seller',
-    description: 'Full access to Polygon Area Measurement, GPS Coordinate Pinpoint & DP Maps for 30 days'
+    description: 'Full GIS Pro access: Excluded Part (EP - वगळलेला भाग) modification map overlays, Road Distance, Polygon Area, GPS Coordinates & DP Maps for 30 days.'
   },
   'pro_1y': {
     id: 'pro_1y',
@@ -431,7 +431,7 @@ const SUBSCRIPTION_PLANS = {
     singleUse: false,
     badge: 'Ultimate Value',
     savings: '~₹500/mo · Full Pro All Year',
-    description: 'Full 1-year unlimited GIS Pro access: Polygon Area, GPS Coordinates & all measurement tools'
+    description: 'Full 1-year unlimited GIS Pro access: Excluded Part (EP - वगळलेला भाग) modification map overlays, Road Distance, Polygon Area, GPS Coordinates & DP Maps.'
   }
 };
 
@@ -1570,10 +1570,10 @@ async function verifyAdminAuth(req, res, next) {
   }
 
   // 2. Secret Key Fallback:
-  // When ADMIN_RECONCILE_KEY is configured in .env or Render, strictly enforce it.
-  // When unconfigured, allow default key for local offline development.
   const rawProvidedKey = req.body?.adminKey || req.headers['x-admin-key'] || req.query?.adminKey;
   const providedKey = String(rawProvidedKey || '').replace(/^["']|["']$/g, '').trim();
+  // When ADMIN_RECONCILE_KEY is configured on Render, strictly require that exact key.
+  // Never accept default key on production when a secret env key is configured.
   const isKeyValid = envAdminKey
     ? (providedKey === envAdminKey)
     : (providedKey === defaultAdminKey);
@@ -1612,13 +1612,19 @@ app.post('/api/admin-reconcile', verifyAdminAuth, async (req, res) => {
   const results = [];
 
   try {
-    const limit = Math.min(Math.max(parseInt(req.body.limit, 10) || 50, 1), 100);
-    // Fetch last payments from Razorpay
+    const requestedLimit = parseInt(req.body.limit, 10) || 1000;
+    const maxTotal = Math.min(Math.max(requestedLimit, 50), 2000);
     let payments = [];
+    let skip = 0;
+    const batchSize = 100;
+
     try {
-      const page = await razorpay.payments.all({ count: limit, skip: 0 });
-      if (page && Array.isArray(page.items)) {
-        payments = page.items;
+      while (payments.length < maxTotal) {
+        const page = await razorpay.payments.all({ count: batchSize, skip });
+        if (!page || !Array.isArray(page.items) || page.items.length === 0) break;
+        payments = payments.concat(page.items);
+        if (page.items.length < batchSize) break;
+        skip += page.items.length;
       }
     } catch (fetchErr) {
       const msg = fetchErr.error?.description || fetchErr.message || 'Razorpay payments fetch failed';
@@ -1687,12 +1693,16 @@ app.post('/api/admin-reconcile', verifyAdminAuth, async (req, res) => {
       let writeStatus = 'synced';
       try {
         const existingDoc = await adminDb.collection('subscriptions').doc(pid).get();
-        if (existingDoc.exists && existingDoc.data().isProvisioned) {
+        const alreadyInLedger = existingDoc.exists && existingDoc.data().isProvisioned;
+        
+        // Always write to user subscription profile to ensure multi-payment accumulation
+        await writeSubscriptionToFirestore(subRecord, pid, phone, email);
+        
+        if (alreadyInLedger) {
           skipped++;
           results.push({ ...subRecord, status: 'already_provisioned' });
           continue;
         }
-        await writeSubscriptionToFirestore(subRecord, pid, phone, email);
         synced++;
       } catch (fsErr) {
         const isQuota = (fsErr.message || '').includes('RESOURCE_EXHAUSTED') || (fsErr.code === 8);
