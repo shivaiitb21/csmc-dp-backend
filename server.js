@@ -18,6 +18,7 @@ try {
 
 // Firebase Admin SDK for authoritative Firestore writes
 let adminDb = null;
+let adminAuth = null;
 try {
   let admin = null;
   try {
@@ -83,11 +84,13 @@ try {
       });
       console.log('[Firebase] Admin SDK initialized successfully with service account');
       adminDb = admin.firestore();
+      try { adminAuth = admin.auth(); } catch (e) { }
     } else {
       console.warn('[Firebase] No valid service account provided. Firestore writes will be skipped.');
     }
-  } else {
+  } else if (admin && admin.apps && admin.apps.length) {
     adminDb = admin.firestore();
+    try { adminAuth = admin.auth(); } catch (e) { }
   }
   if (adminDb) {
     console.log('[Firebase] Firestore connection ready');
@@ -616,6 +619,8 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
         if (existingDoc.exists) {
           const oldData = existingDoc.data() || {};
           const now = Date.now();
+          const incomingDurMs = Math.max(0, Number(subRecord.expiryTimestamp || 0) - Number(subRecord.purchaseTimestamp || now));
+          const validDurationMs = incomingDurMs > 0 ? incomingDurMs : (30 * 24 * 60 * 60 * 1000);
 
           const isNewPro = Boolean(subRecord.isPro || subRecord.scope === 'pro' || subRecord.role === 'pro');
           const oldProExp = oldData.proExpiryTimestamp || (oldData.isPro && oldData.expiryTimestamp ? Number(oldData.expiryTimestamp) : 0);
@@ -624,11 +629,12 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
           let newProExp = isNewPro ? Number(subRecord.expiryTimestamp) : oldProExp;
           let newBasicExp = !isNewPro ? Number(subRecord.expiryTimestamp) : oldBasicExp;
 
+          // CUMULATIVE TIME STACKING: If already active, add the new duration to existing expiry
           if (isNewPro && oldProExp > now) {
-            newProExp = Math.max(oldProExp, Number(subRecord.expiryTimestamp));
+            newProExp = oldProExp + validDurationMs;
           }
           if (!isNewPro && oldBasicExp > now) {
-            newBasicExp = Math.max(oldBasicExp, Number(subRecord.expiryTimestamp));
+            newBasicExp = oldBasicExp + validDurationMs;
           }
 
           const maxExp = Math.max(newProExp || 0, newBasicExp || 0, Number(subRecord.expiryTimestamp || 0));
@@ -700,21 +706,44 @@ async function writeSubscriptionToFirestore(subRecord, paymentId, phone, email) 
         console.warn('[Firestore] Error merging stacked subscription profile:', mergeErr.message);
       }
 
-      batch.set(adminDb.collection('users_subscriptions').doc(targetDocId), mergedProfile, { merge: true });
+      // Dual index: save under phone AND email key so either can restore access
+      if (phone && phone.length === 10) {
+        batch.set(adminDb.collection('users_subscriptions').doc(phone), mergedProfile, { merge: true });
+      }
+      if (email && email.includes('@')) {
+        const emailDocId = email.replace(/[@.]/g, '_');
+        batch.set(adminDb.collection('users_subscriptions').doc(emailDocId), mergedProfile, { merge: true });
+      }
+      if (!phone && (!email || !email.includes('@'))) {
+        batch.set(adminDb.collection('users_subscriptions').doc(targetDocId), mergedProfile, { merge: true });
+      }
     }
 
     // 3. Authoritatively sync entitlements to users collection
     let uId = subRecord.userId || subRecord.uid;
-    // Auto-discover uId from users collection by phone or email if not explicitly provided
+    // Auto-discover uId from users collection or Firebase Auth by phone or email if not explicitly provided
     if (!uId) {
       try {
         if (phone && phone.length === 10) {
           const uSnap = await adminDb.collection('users').where('phone', '==', phone).limit(1).get();
           if (!uSnap.empty) uId = uSnap.docs[0].id;
         }
-        if (!uId && email) {
+        if (!uId && email && email.includes('@')) {
           const uSnapEmail = await adminDb.collection('users').where('email', '==', email.toLowerCase().trim()).limit(1).get();
           if (!uSnapEmail.empty) uId = uSnapEmail.docs[0].id;
+        }
+        // Fallback: check Firebase Auth directly
+        if (!uId && email && email.includes('@')) {
+          try {
+            const au = await admin.auth().getUserByEmail(email.toLowerCase().trim());
+            if (au && au.uid) uId = au.uid;
+          } catch (authLookupErr) {}
+        }
+        if (!uId && phone && phone.length === 10) {
+          try {
+            const au = await admin.auth().getUserByPhoneNumber('+91' + phone);
+            if (au && au.uid) uId = au.uid;
+          } catch (authPhoneErr) {}
         }
       } catch (findErr) {
         console.warn('[Firestore] Notice finding user by phone/email:', findErr.message);
@@ -1300,6 +1329,57 @@ async function handleSubscriptionLookup(req, res) {
         found: false,
         error: "Ownership verification required: To restore access via Payment ID, you must also provide the registered email address or mobile number used during purchase."
       });
+    }
+
+    // Pre-Registration Self-Heal: If userId is provided with registered phone/email, automatically link active pass!
+    const targetUserId = String(params.userId || params.uid || '').trim();
+    if (targetUserId && (rawEmail || rawPhone)) {
+      try {
+        // SECURITY VERIFICATION: Verify that targetUserId legitimately owns the requested email/phone in Firebase Auth
+        if (adminAuth) {
+          try {
+            const userRecord = await adminAuth.getUser(targetUserId);
+            const recEmail = (userRecord.email || '').toLowerCase().trim();
+            const recPhone = normalizeIndianPhone(userRecord.phoneNumber || '');
+            const isOwner = (rawEmail && recEmail && recEmail === rawEmail.toLowerCase().trim()) ||
+                            (rawPhone && recPhone && recPhone === rawPhone);
+            if (!isOwner) {
+              console.warn(`[Security Alert] User ${targetUserId} attempted to link subscription for ${rawEmail || rawPhone} without matching credentials.`);
+              return res.status(403).json({
+                success: false,
+                error: "Ownership verification failed: Account email/phone does not match the subscription record."
+              });
+            }
+          } catch (authErr) {
+            console.warn(`[Security Alert] Invalid targetUserId ${targetUserId}:`, authErr.message);
+            return res.status(401).json({
+              success: false,
+              error: "Invalid user session."
+            });
+          }
+        }
+
+        let existingSub = null;
+        if (rawPhone && rawPhone.length === 10) {
+          const s = await adminDb.collection('users_subscriptions').doc(rawPhone).get();
+          if (s.exists) existingSub = s.data();
+        }
+        if (!existingSub && rawEmail && rawEmail.includes('@')) {
+          const s = await adminDb.collection('users_subscriptions').doc(rawEmail.replace(/[@.]/g, '_')).get();
+          if (s.exists) existingSub = s.data();
+        }
+        if (existingSub && existingSub.isSubscribed && Number(existingSub.expiryTimestamp || 0) > Date.now()) {
+          await writeSubscriptionToFirestore({ ...existingSub, userId: targetUserId }, existingSub.paymentId, rawPhone, rawEmail);
+          return res.status(200).json({
+            success: true,
+            found: true,
+            active: true,
+            subscription: existingSub
+          });
+        }
+      } catch (linkErr) {
+        console.warn('[Lookup] Pre-registration link notice:', linkErr.message);
+      }
     }
 
     if (!rawPayId && (rawEmail || rawPhone)) {
